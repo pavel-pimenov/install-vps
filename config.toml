@@ -1,0 +1,11 @@
+# Конфиг для install-vps.
+# Ключи CLI перекрывают значения из этого файла.
+
+host = ""                     # IP или DNS имя VPS
+user = "root"                 # пользователь SSH
+port = 22
+key_path = "~/.ssh/id_ed25519"
+accept_new = true             # автоматически добавить новый host в known_hosts
+
+# Минимальный набор софта (можно переопределить через --packages)
+# packages = ["nload", "htop", "btop", "mc", "git", "docker-compose-v2"]
