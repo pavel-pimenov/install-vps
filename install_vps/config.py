@@ -5,7 +5,16 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_PACKAGES = ["nload", "htop", "btop", "mc", "git", "docker-compose-v2"]
+DEFAULT_PACKAGES = [
+    "nload",
+    "htop",
+    "btop",
+    "mc",
+    "git",
+    "docker-compose-v2",
+    "fail2ban",   # блокировка bruteforce (sshd)
+    "ncdu",       # анализ диска (экономия места)
+]
 
 
 @dataclass
@@ -17,6 +26,7 @@ class Config:
     sudo: bool = False
     accept_new: bool = True
     packages: list[str] = field(default_factory=lambda: list(DEFAULT_PACKAGES))
+    swap_size_mb: int = 512
 
 
 def load_config(path: Path | None) -> Config:
