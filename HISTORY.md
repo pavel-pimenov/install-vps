@@ -4,6 +4,22 @@
 версионирование — [SemVer](https://semver.org/lang/ru/). Обратный
 хронологический порядок.
 
+## [0.6.0] — 2026-09-25
+
+### Добавлено
+
+- Вход в Beszel через OAuth2 (Google/GitHub/любой поддерживаемый провайдер) без
+  локального пароля: `--beszel-user-creation` (`USER_CREATION=true`) и
+  `--beszel-disable-password-auth` (`DISABLE_PASSWORD_AUTH=true`), одноимённые
+  ключи `config.toml`. Провайдер добавляется в веб-UI Hub:
+  `/_/#/settings` -> выключить «Hide collection create and edit controls» ->
+  коллекция `users` -> Options -> OAuth2, redirect URL
+  `<домен>/api/oauth2-redirect`.
+- `DISABLE_PASSWORD_AUTH` нельзя включить без `USER_CREATION`: иначе новые
+  пользователи не смогут войти через OAuth, и доступ к Hub будет потерян.
+  Проверка выполняется на стороне Python до отправки скрипта на хост.
+- При отключении пароля печатается напоминание с адресом настроек OAuth.
+
 ## [0.5.0] — 2026-09-25
 
 ### Добавлено

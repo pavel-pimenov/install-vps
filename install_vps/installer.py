@@ -48,6 +48,30 @@ _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def _beszel_auth_env(cfg: Config) -> str:
+    """Дополнительные переменные окружения Hub для режима OAuth."""
+    lines = []
+    if cfg.beszel_user_creation:
+        lines.append('      USER_CREATION: "true"')
+    if cfg.beszel_disable_password_auth:
+        lines.append('      DISABLE_PASSWORD_AUTH: "true"')
+    if not lines:
+        return ""
+    return "\n" + "\n".join(lines)
+
+
+def _beszel_auth_warning(cfg: Config) -> str:
+    """Предупреждение про потерю пароля, если OAuth ещё не настроен."""
+    if not cfg.beszel_disable_password_auth:
+        return ""
+    domain = cfg.caddy_domain or "<домен Beszel>"
+    return (
+        'echo "  ВНИМАНИЕ: DISABLE_PASSWORD_AUTH=true — парольный вход отключён."\n'
+        'echo "  Убедитесь, что OAuth настроен и вход через него проверен:"\n'
+        f'echo "    https://{domain}/_/#/settings -> users -> Options -> OAuth2."\n'
+    )
+
+
 def _caddy_site_block(domain: str, upstream: str) -> str:
     """Обычный сайт: домен -> upstream. Отступы табами — канонический caddy fmt."""
     return f"{domain} {{\n\treverse_proxy {upstream}\n}}\n"
@@ -453,7 +477,7 @@ services:
     container_name: beszel
     restart: unless-stopped
     environment:
-      APP_URL: {app_url}
+      APP_URL: {app_url}{auth_env}
     ports:
       - "{port}:{port}"
     volumes:
@@ -475,7 +499,7 @@ services:
       KEY: "{key}"
       TOKEN: "{token}"
 BESZEL_EOF
-if [ -z {key_quoted} ]; then
+{auth_warning}if [ -z {key_quoted} ]; then
   echo "  ВНИМАНИЕ: не задан beszel_agent_key — агент не сможет подключиться к Hub."
   echo "  Откройте http://<host>:{port} -> создайте пользователя -> Add system,"
   echo "  скопируйте ключ агента в beszel_agent_key (config.toml или --beszel-key)"
@@ -697,6 +721,13 @@ def install(cfg: Config, host: RemoteHost) -> None:
                     f"{label} содержит недопустимые символы "
                     '(кавычки или перевод строки); скопируйте значение целиком'
                 )
+        if cfg.beszel_disable_password_auth and not cfg.beszel_user_creation:
+            raise ValueError(
+                "beszel_disable_password_auth требует beszel_user_creation: "
+                "иначе новые пользователи не смогут войти через OAuth и вы "
+                "потеряете доступ к Hub. Сначала настройте OAuth в веб-UI, "
+                "затем включайте оба флага вместе"
+            )
         script += BESZEL_STACK.format(
             port=cfg.beszel_port,
             dir=BESZEL_DIR,
@@ -706,6 +737,8 @@ def install(cfg: Config, host: RemoteHost) -> None:
                 if cfg.caddy and cfg.caddy_domain
                 else f"http://localhost:{cfg.beszel_port}"
             ),
+            auth_env=_beszel_auth_env(cfg),
+            auth_warning=_beszel_auth_warning(cfg),
             key=cfg.beszel_agent_key,
             key_quoted=_sh_quote(cfg.beszel_agent_key),
             token=cfg.beszel_agent_token,

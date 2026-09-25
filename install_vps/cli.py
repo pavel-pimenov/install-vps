@@ -35,6 +35,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="публичный ключ агента Beszel (из веб-UI Hub: Add system)")
     p.add_argument("--beszel-token",
                    help="токен агента Beszel (из того же диалога Add system)")
+    p.add_argument("--beszel-user-creation", action="store_true",
+                   help="разрешить регистрацию новых пользователей (нужно для OAuth)")
+    p.add_argument("--beszel-disable-password-auth", action="store_true",
+                   help="вход только через OAuth, пароль отключить "
+                        "(включайте лишь после проверки, что OAuth работает — иначе логин потерян)")
     p.add_argument("--zram-size-mb", type=int,
                    help="размер zram-свопа в МБ, 0 — не трогать (по умолчанию 0)")
     p.add_argument("--journald-max-use", metavar="SIZE",

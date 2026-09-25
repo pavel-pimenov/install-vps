@@ -35,6 +35,8 @@ class Config:
     beszel_port: int = 8090
     beszel_agent_key: str = ""      # публичный ключ агента (веб-UI Hub: Add system)
     beszel_agent_token: str = ""    # токен агента из того же диалога (обязателен в 0.20+)
+    beszel_user_creation: bool = False  # разрешить самостоятельную регистрацию (для OAuth)
+    beszel_disable_password_auth: bool = False  # вход только через OAuth (ломает пароль!)
     zram_size_mb: int = 0          # размер zram-свопа в МБ (0 — выключить; докерится пакетом)
     journald_max_use: str = "100M"  # лимит systemd-журнала
     docker_log_max_size: str = "10m"  # размер одного файла лога контейнера
@@ -67,6 +69,8 @@ _OVERRIDES = (
     ("beszel_port", "beszel_port"),
     ("beszel_agent_key", "beszel_key"),
     ("beszel_agent_token", "beszel_token"),
+    ("beszel_user_creation", "beszel_user_creation"),
+    ("beszel_disable_password_auth", "beszel_disable_password_auth"),
     ("zram_size_mb", "zram_size_mb"),
     ("journald_max_use", "journald_max_use"),
     ("docker_log_max_size", "docker_log_max_size"),
