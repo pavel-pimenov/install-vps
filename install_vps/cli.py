@@ -28,6 +28,13 @@ def _parser() -> argparse.ArgumentParser:
                         "(по умолчанию: nload htop btop mc git docker-compose-v2)")
     p.add_argument("--verify-only", action="store_true",
                    help="только проверить наличие пакетов, ничего не ставить")
+    p.add_argument("--beszel", action="store_true",
+                   help="поднять Beszel Hub+Agent одним docker compose (порт 8090)")
+    p.add_argument("--beszel-port", type=int, help="порт Beszel Hub (по умолчанию 8090)")
+    p.add_argument("--beszel-key",
+                   help="публичный ключ агента Beszel (из веб-UI Hub: Add system)")
+    p.add_argument("--beszel-token",
+                   help="токен агента Beszel (из того же диалога Add system)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 

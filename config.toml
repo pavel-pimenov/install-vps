@@ -9,3 +9,12 @@ accept_new = true             # автоматически добавить но
 
 # Минимальный набор софта (можно переопределить через --packages)
 # packages = ["nload", "htop", "btop", "mc", "git", "docker-compose-v2"]
+
+# Мониторинг Beszel (Hub + Agent на одной машине, docker compose, порт 8090)
+# beszel = true
+# beszel_port = 8090
+# Ключ и токен агента выдаёт веб-UI Hub: открыть http://<host>:8090, создать
+# пользователя, Add system -> скопировать оба значения и перезапустить
+# install-vps (повторный запуск идемпотентно добавит/пересоздаст агента).
+# beszel_agent_key = "ssh-ed25519 AAAA..."
+# beszel_agent_token = "xxxx-xxxx-xxxx-xxxx"
