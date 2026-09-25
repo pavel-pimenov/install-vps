@@ -99,6 +99,33 @@ echo "  compress: $(grep -h '^compress' /etc/logrotate.conf)"
 fi
 """
 
+UNATTENDED_UPGRADES = r"""
+echo "==> unattended-upgrades: без интерактивных вопросов"
+$SUDO apt-get install -y unattended-upgrades
+$SUDO install -m 0755 -d /etc/apt/apt.conf.d
+cat <<'UU_EOF' | $SUDO tee /etc/apt/apt.conf.d/52unattended-upgrades-local >/dev/null
+// Локальные настройки install-vps.
+// unattended-upgrades запускается без tty: на вопросы debconf/ucf про
+// изменённые конфиги отвечать некому — процесс просто зависнет.
+// --force-confdef: оставить версию из пакета, --force-confold: оставить свою.
+Dpkg::Options {
+  "--force-confdef";
+  "--force-confold";
+};
+UU_EOF
+if [ -f /etc/needrestart/needrestart.conf ]; then
+  $SUDO sed -i 's/^\(NEEDRESTART_MODE=\).*/\1a/' /etc/needrestart/needrestart.conf
+  grep -q '^NEEDRESTART_MODE=a' /etc/needrestart/needrestart.conf \
+    || echo 'NEEDRESTART_MODE=a' \
+      | $SUDO tee -a /etc/needrestart/needrestart.conf >/dev/null
+  echo "  needrestart: NEEDRESTART_MODE=a (авто, без вопросов)"
+fi
+$SUDO systemctl enable unattended-upgrades.service >/dev/null 2>&1 || true
+echo "  Dpkg::Options: --force-confdef --force-confold"
+echo "  unattended-upgrades: $(systemctl is-enabled unattended-upgrades.service 2>/dev/null)"
+echo "  apt-daily-upgrade.timer: $(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null)"
+"""
+
 KEYRING_CLEANUP = r"""
 echo "==> чистим старые ядра (для малого места на диске)"
 CURRENT="$(uname -r)"
@@ -213,38 +240,107 @@ ZRAM = r"""
 echo "==> zram: сжатый своп {size_mb}M (алгоритм zstd)"
 $SUDO apt-get install -y systemd-zram-generator
 $SUDO install -m 0755 -d /etc/systemd
-cat <<'ZRAM_EOF' | $SUDO tee /etc/systemd/zram-generator.conf >/dev/null
+cat <<'ZRAM_CONF_EOF' | $SUDO tee /etc/systemd/zram-generator.conf >/dev/null
 [zram0]
 zram-size = {size_mb}M
 compression-algorithm = zstd
-ZRAM_EOF
+ZRAM_CONF_EOF
+# systemd-zram-generator на слабой памяти падает с ENOMEM (Committed_AS выше
+# CommitLimit) и не повторяет попытку — zram не появляется после перезагрузки.
+# Свой юнит запускается позже, когда память уже разгружена, и уменьшает
+# размер по шагам, пока не хватит.
+cat <<'ZRAM_UNIT_EOF' | $SUDO tee /etc/systemd/system/zram-swap.service >/dev/null
+[Unit]
+Description=Compressed swap in RAM (zram)
+After=systemd-zram-generator.service swap.target
+Before=multi-user.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=ZRAM_TARGET_MB={size_mb}
+ExecStart=/usr/local/sbin/zram-swap-up
+
+[Install]
+WantedBy=multi-user.target
+ZRAM_UNIT_EOF
+cat <<'ZRAM_SCRIPT_EOF' | $SUDO tee /usr/local/sbin/zram-swap-up >/dev/null
+#!/bin/bash
+# Ставит сжатый своп zram, уменьшая размер, пока хватает памяти.
+set -uo pipefail
+
+TARGET_MB="${{ZRAM_TARGET_MB:-{size_mb}}}"
+MIN_MB=32
+DISKSIZE=/sys/block/zram0/disksize
+
+if swapon --show=NAME --noheadings | grep -q '^/dev/zram'; then
+  echo "zram уже активен"
+  exit 0
+fi
+
+modprobe zram 2>/dev/null || true
+for _ in $(seq 1 10); do
+  [ -e "$DISKSIZE" ] && break
+  sleep 1
+done
+if [ ! -e "$DISKSIZE" ]; then
+  echo "zram: /sys/block/zram0 недоступен, модуль zram не загрузился" >&2
+  exit 1
+fi
+
+case "$TARGET_MB" in
+  ''|*[!0-9]*) echo "zram: некорректный размер '$TARGET_MB'" >&2; exit 1 ;;
+esac
+if [ "$TARGET_MB" -lt "$MIN_MB" ]; then
+  TARGET_MB="$MIN_MB"
+fi
+# zram больше всей RAM бесполезен и опасен: memlimit вытеснит в своп всё
+# остальное. Ограничиваем размером физической памяти.
+RAM_KB="$(awk '/^MemTotal:/{{print $2}}' /proc/meminfo)"
+RAM_MB=$((RAM_KB / 1024))
+if [ "$RAM_MB" -gt 0 ] && [ "$TARGET_MB" -gt "$RAM_MB" ]; then
+  echo "zram: запрошено ${{TARGET_MB}}M > RAM ${{RAM_MB}}M, ограничиваю"
+  TARGET_MB="$RAM_MB"
+fi
+
+MB="$TARGET_MB"
+ATTEMPT=0
+while [ "$MB" -ge "$MIN_MB" ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  # сброс обязателен: повторная запись disksize без него вернёт EINVAL
+  timeout 10 sh -c "printf '%s\n' 1 > /sys/block/zram0/reset" 2>/dev/null || true
+  # запись в disksize может висеть неограниченно долго, если ядро уходит в
+  # своп-цикл при выделении memlimit — ограничиваем и падаем на таймауте
+  if timeout 10 sh -c "printf '%s\n' $((MB * 1024 * 1024)) > $DISKSIZE" \
+      2>/dev/null; then
+    printf '%s\n' zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+    if mkswap /dev/zram0 >/dev/null 2>&1 \
+      && swapon -p 100 /dev/zram0 2>/dev/null; then
+      echo "zram: активирован ${{MB}}M (попытка $ATTEMPT)"
+      exit 0
+    fi
+  fi
+  echo "zram: ${{MB}}M не удалось выделить, уменьшаю" >&2
+  NEXT=$((MB / 2))
+  [ "$NEXT" -lt "$MIN_MB" ] && NEXT="$MIN_MB"
+  MB="$NEXT"
+  sleep 2
+done
+
+echo "zram: не удалось выделить даже ${{MIN_MB}}M" >&2
+exit 1
+ZRAM_SCRIPT_EOF
+$SUDO chmod 0755 /usr/local/sbin/zram-swap-up
 $SUDO systemctl daemon-reload
+$SUDO systemctl enable zram-swap.service >/dev/null 2>&1 || true
 if swapon --show=NAME --noheadings | grep -q '^/dev/zram'; then
   echo "  zram уже активен, конфигурацию не трогаем"
 else
-  $SUDO modprobe zram 2>/dev/null || true
-  for _ in $(seq 1 10); do
-    if [ -e /sys/block/zram0/disksize ]; then break; fi
-    sleep 1
-  done
-  if [ -e /sys/block/zram0/disksize ]; then
-    SIZE_BYTES=$(({size_mb} * 1024 * 1024))
-    CURRENT_BYTES="$(cat /sys/block/zram0/disksize)"
-    if [ "$CURRENT_BYTES" -ne "$SIZE_BYTES" ]; then
-      printf '%s\n' "$SIZE_BYTES" \
-        | $SUDO tee /sys/block/zram0/disksize >/dev/null
-    fi
-    printf '%s\n' zstd \
-      | $SUDO tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1 || true
-    $SUDO mkswap /dev/zram0 >/dev/null
-    $SUDO swapon -p 100 /dev/zram0
-    echo "  активирован /dev/zram0 (приоритет 100)"
-  else
-    echo "  ВНИМАНИЕ: /sys/block/zram0 недоступен — zram заработает после перезагрузки."
-  fi
+  $SUDO /usr/local/sbin/zram-swap-up
 fi
 swapon --show
-echo "  при следующей загрузке zram поднимет systemd-zram-generator"
+echo "  после перезагрузки zram поднимет zram-swap.service"
 """
 
 BESZEL_STACK = r"""
@@ -397,6 +493,7 @@ def install(cfg: Config, host: RemoteHost) -> None:
         keep_free="200M",
     )
     script += LOGROTATE_COMPRESS
+    script += UNATTENDED_UPGRADES
     script += KEYRING_CLEANUP
     if cfg.zram_size_mb > 0:
         script += ZRAM.format(size_mb=cfg.zram_size_mb)

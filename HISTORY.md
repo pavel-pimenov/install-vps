@@ -4,15 +4,38 @@
 версионирование — [SemVer](https://semver.org/lang/ru/). Обратный
 хронологический порядок.
 
+## [0.4.0] — 2026-09-25
+
+### Добавлено
+
+- `UNATTENDED_UPGRADES` — `/etc/apt/apt.conf.d/52unattended-upgrades-local`
+  с `Dpkg::Options` (`--force-confdef`, `--force-confold`). Без них фоновое
+  обновление без tty зависает на вопросах debconf/ucf об изменённых конфигах.
+  Если установлен `needrestart`, выставляется `NEEDRESTART_MODE=a`; иначе его
+  не трогаем. Повторный прогон идемпотентен.
+
+### Исправлено
+
+- **Критично: `zram` не поднимался после перезагрузки.** На VPS с 704 МБ RAM
+  `systemd-zram-generator` падал с `ENOMEM` (`Committed_AS` выше `CommitLimit`)
+  и не повторял попытку, поэтому в swap оставался только `/swapfile`.
+  Теперь вместо генератора ставится `zram-swap.service` +
+  `/usr/local/sbin/zram-swap-up`, который стартует позже, когда память уже
+  разгружена: уменьшает размер по шагам (`256→128→64→32` МБ) до первого
+  успеха, ограничивает каждую запись в `disksize` таймаутом (иначе ядро может
+  уйти в своп-цикл), не даёт запросить zram больше физической RAM и корректно
+  переживает отсутствие `/proc/meminfo`. Конфиг генератора сохранён.
+
 ## [0.3.0] — 2026-09-25
 
 ### Добавлено
 
 - `ZRAM` — сжатый своп через пакет `systemd-zram-generator`:
   `/etc/systemd/zram-generator.conf` (`zram-size`, `compression-algorithm = zstd`).
-  Активируется сразу (`/dev/zram0`, приоритет 100 — выше обычного swapfile) и
-  поднимается генератором при следующей загрузке. Включается `--zram-size-mb
+  Активируется сразу (`/dev/zram0`, приоритет 100 — выше обычного swapfile).
+  Включается `--zram-size-mb
   256`; по умолчанию выключено (`0`), чтобы не менять поведение молча.
+  *См. 0.4.0: загрузочный путь перенесён на собственный юнит.*
 - `JOURNALD_LIMIT` — лимит systemd-журнала через drop-in
   `/etc/systemd/journald.conf.d/10-size-limit.conf` (`SystemMaxUse`,
   `SystemKeepFree=200M`, `MaxRetentionSec=2week`) + `journalctl --vacuum-size`.
