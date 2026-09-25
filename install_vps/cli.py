@@ -43,6 +43,15 @@ def _parser() -> argparse.ArgumentParser:
                    help="размер лога контейнера, напр. 10m (по умолчанию 10m)")
     p.add_argument("--docker-log-max-file", metavar="N",
                    help="число файлов лога на контейнер (по умолчанию 3)")
+    p.add_argument("--caddy", action="store_true",
+                   help="поставить Caddy: автоматический HTTPS для сайтов (80/443)")
+    p.add_argument("--caddy-email", metavar="EMAIL",
+                   help="e-mail для Let's Encrypt (уведомления об истечении сертификата)")
+    p.add_argument("--caddy-domain", metavar="DOMAIN",
+                   help="домен для Beszel Hub, напр. monitor.example.com")
+    p.add_argument("--caddy-site", metavar="DOMAIN=UPSTREAM", action="append",
+                   help="любой сайт: monitor.example.com=http://127.0.0.1:8080 "
+                        "(можно указать несколько раз)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 

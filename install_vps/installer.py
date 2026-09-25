@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 
 from .config import Config
@@ -26,9 +27,99 @@ _DOCKER_OFFICIAL_PACKAGES = [
 _OS_RELEASE_FIELDS = 2
 
 
+def _yaml_str(value: str) -> str:
+    """Строка для YAML в docker-compose: кавычки, если есть спецсимволы."""
+    if value == "" or any(ch in value for ch in ":#{}[],&*?|<>=!%@`\"'"):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    return value
+
+
 def _sh_quote(value: str) -> str:
     """Обернуть значение в одинарные кавычки для безопасной подстановки в bash."""
     return "'" + value.replace("'", "'\\''") + "'"
+
+
+_HOSTNAME_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+_UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _caddy_site_block(domain: str, upstream: str) -> str:
+    """Обычный сайт: домен -> upstream. Отступы табами — канонический caddy fmt."""
+    return f"{domain} {{\n\treverse_proxy {upstream}\n}}\n"
+
+
+def _caddy_beszel_block(domain: str, port: int) -> str:
+    """Сайт Beszel Hub с настройками из официальной документации beszel.dev.
+
+    request_body max_size — Beszel шлёт большие тела при импорте/экспорте,
+    read_timeout 360s — долгие опросы и WebSocket агентов с universal token.
+    """
+    return (
+        f"{domain} {{\n"
+        f"\trequest_body {{\n"
+        f"\t\tmax_size 10MB\n"
+        f"\t}}\n"
+        f"\treverse_proxy 127.0.0.1:{port} {{\n"
+        f"\t\ttransport http {{\n"
+        f"\t\t\tread_timeout 360s\n"
+        f"\t\t}}\n"
+        f"\t}}\n"
+        f"}}\n"
+    )
+
+
+def _caddy_caddyfile(email: str) -> str:
+    """Корневой Caddyfile: глобальные опции + подключение всех сайтов."""
+    lines = ["{"]
+    if email:
+        lines.append(f"\temail {email}")
+    lines.append("}")
+    lines.append(f"import {CADDY_SITES_DIR_IN_CONTAINER}/*.caddy")
+    return "\n".join(lines) + "\n"
+
+
+def _caddy_sites_script(cfg: Config) -> str:
+    """Готовые bash-фрагменты, создающие по файлу на каждый сайт.
+
+    Содержимое файлов не проходит через .format(), поэтому фигурные скобки
+    Caddyfile не нужно экранировать.
+    """
+    sites: list[tuple[str, str]] = []
+    if cfg.caddy_domain:
+        sites.append(("beszel", _caddy_beszel_block(cfg.caddy_domain, cfg.beszel_port)))
+    for raw in cfg.caddy_sites:
+        domain, sep, upstream = raw.partition("=")
+        if not sep:
+            raise ValueError(
+                f"caddy_site должен быть вида ДОМЕН=UPSTREAM, а получено {raw!r}"
+            )
+        domain, upstream = domain.strip(), upstream.strip()
+        if not _HOSTNAME_RE.match(domain):
+            raise ValueError(f"Некорректный домен в caddy_site: {domain!r}")
+        if not _UPSTREAM_RE.match(upstream):
+            raise ValueError(f"Некорректный upstream в caddy_site: {upstream!r}")
+        sites.append((domain, _caddy_site_block(domain, upstream)))
+
+    script = ""
+    for name, content in sites:
+        script += (
+            f"cat <<'CADDY_SITE_EOF' | $SUDO tee {CADDY_SITES_DIR}/{name}.caddy >/dev/null\n"
+            f"{content}"
+            "CADDY_SITE_EOF\n"
+        )
+    if not sites:
+        script += (
+            'echo "  ВНИМАНИЕ: не задан ни одного домена — Caddy поднимется,'
+            ' но сайтов не будет."\n'
+            'echo "  Добавьте --caddy-domain (Beszel) и/или'
+            ' --caddy-site ДОМЕН=UPSTREAM."\n'
+        )
+    return script
 
 
 def _bootstrap(sudo: bool) -> str:
@@ -157,6 +248,15 @@ echo "  осталось ядер: $($SUDO dpkg -l 'linux-image-*' 2>/dev/null |
 
 BESZEL_DIR = "/opt/beszel"
 BESZEL_COMPOSE = "/opt/beszel/docker-compose.yml"
+
+# Caddy: постоянные пути. Сайты лежат отдельными файлами в sites/ и
+# подключаются через import — новый сайт добавляется одним файлом.
+CADDY_DIR = "/opt/caddy"
+CADDY_COMPOSE = "/opt/caddy/docker-compose.yml"
+CADDY_SITES_DIR = "/opt/caddy/sites"
+# внутри контейнера sites/ примонтирован в /etc/caddy/sites — Caddyfile
+# пишется и читается уже по контейнерному пути
+CADDY_SITES_DIR_IN_CONTAINER = "/etc/caddy/sites"
 
 JOURNALD_LIMIT = r"""
 echo "==> journald: ограничиваем размер журнала ({max_use})"
@@ -353,7 +453,7 @@ services:
     container_name: beszel
     restart: unless-stopped
     environment:
-      APP_URL: http://localhost:{port}
+      APP_URL: {app_url}
     ports:
       - "{port}:{port}"
     volumes:
@@ -388,6 +488,90 @@ fi
 $SUDO docker compose -f {compose} up -d --remove-orphans
 $SUDO docker compose -f {compose} ps
 echo "  Hub: http://<host>:{port}"
+"""
+
+CADDY = r"""
+echo "==> Caddy: обратный прокси с автоматическим HTTPS (порты 80/443)"
+$SUDO install -m 0755 -d {dir} {sites_dir}
+cat <<'CADDY_COMPOSE_EOF' | $SUDO tee {compose} >/dev/null
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ACME_EMAIL: "{email}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./sites:/etc/caddy/sites:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:
+CADDY_COMPOSE_EOF
+cat <<'CADDYFILE_EOF' | $SUDO tee {dir}/Caddyfile >/dev/null
+{caddyfile}
+CADDYFILE_EOF
+{sites}
+$SUDO docker compose -f {compose} up -d --remove-orphans
+$SUDO docker compose -f {compose} ps
+for _ in $(seq 1 30); do
+  if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx caddy; then break; fi
+  sleep 2
+done
+if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx caddy; then
+  # конфиг примонтирован, но Caddy держит старый в памяти — нужен reload,
+  # иначе повторный прогон ничего не применит
+  if $SUDO docker exec caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    echo "  конфиг перечитан (caddy reload)"
+  else
+    echo "  caddy reload не удался, перезапускаю контейнер"
+    $SUDO docker restart caddy >/dev/null
+  fi
+else
+  echo "  ОШИБКА: контейнер caddy не запустился:"
+  $SUDO docker compose -f {compose} logs 2>&1 | tail -20 | sed 's/^/    /'
+  exit 1
+fi
+if ! $SUDO docker exec caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+  echo "  ОШИБКА: Caddyfile не прошёл проверку:"
+  $SUDO docker exec caddy caddy validate --config /etc/caddy/Caddyfile 2>&1 | sed 's/^/    /'
+  exit 1
+fi
+echo "  Caddyfile корректен (caddy validate)"
+echo "  сайты: {sites_dir}/*.caddy — новый сайт добавляется одним файлом"
+echo "  перечитать: $SUDO docker exec caddy caddy reload --config /etc/caddy/Caddyfile"
+echo "  логи:      $SUDO docker logs -f caddy"
+"""
+
+CADDY_VERIFY = r"""
+if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx caddy; then
+  echo "  OK: caddy -> $($SUDO docker ps --filter name=^/caddy$ --format '{{{{.Status}}}}')"
+  if $SUDO ss -tln 2>/dev/null | grep -qE ':(80|443)[[:space:]]'; then
+    echo "  OK: caddy слушает 80/443"
+  else
+    echo "  WARN: порты 80/443 не слушаются"
+  fi
+  if $SUDO docker exec caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    echo "  OK: Caddyfile валиден"
+  else
+    echo "  MISSING: Caddyfile невалиден"
+  fi
+else
+  echo "  MISSING: caddy"
+fi
+for f in $($SUDO ls {sites_dir}/*.caddy 2>/dev/null); do
+  [ -e "$f" ] || continue
+  echo "  сайт: $(basename "$f" .caddy)"
+done
 """
 
 VERIFY = r"""
@@ -517,12 +701,29 @@ def install(cfg: Config, host: RemoteHost) -> None:
             port=cfg.beszel_port,
             dir=BESZEL_DIR,
             compose=BESZEL_COMPOSE,
+            app_url=_yaml_str(
+                f"https://{cfg.caddy_domain}"
+                if cfg.caddy and cfg.caddy_domain
+                else f"http://localhost:{cfg.beszel_port}"
+            ),
             key=cfg.beszel_agent_key,
             key_quoted=_sh_quote(cfg.beszel_agent_key),
             token=cfg.beszel_agent_token,
             token_quoted=_sh_quote(cfg.beszel_agent_token),
         )
         script += BESZEL_VERIFY
+    if cfg.caddy:
+        if cfg.caddy_email and not _EMAIL_RE.match(cfg.caddy_email):
+            raise ValueError(f"Некорректный caddy_email: {cfg.caddy_email!r}")
+        script += CADDY.format(
+            dir=CADDY_DIR,
+            compose=CADDY_COMPOSE,
+            sites_dir=CADDY_SITES_DIR,
+            email=cfg.caddy_email,
+            caddyfile=_caddy_caddyfile(cfg.caddy_email),
+            sites=_caddy_sites_script(cfg),
+        )
+        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
     script += VERIFY
     host.run_script(script)
 
@@ -531,5 +732,7 @@ def verify(cfg: Config, host: RemoteHost) -> None:
     script = _bootstrap(cfg.sudo)
     if cfg.beszel:
         script += BESZEL_VERIFY
+    if cfg.caddy:
+        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
     script += VERIFY
     host.run_script(script)

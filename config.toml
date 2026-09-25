@@ -30,3 +30,19 @@ accept_new = true             # автоматически добавить но
 # log-driver/log-opts, остальные ключи файла сохраняются)
 # docker_log_max_size = "10m"
 # docker_log_max_file = "3"
+
+# Caddy — обратный прокси с автоматическим HTTPS (Let's Encrypt). Занимает
+# 80/443 на хосте (network_mode: host) и проксирует на локальные порты.
+# Перед включением создайте A-записи доменов на хост:
+#   monitor.example.com  A  <ip-хоста>
+#   thin.example.com     A  <ip-хоста>
+# caddy = true
+# caddy_email = "you@example.com"      # для уведомлений об истечении сертификата
+# caddy_domain = "monitor.example.com" # домен для Beszel Hub
+# Любые другие сайты — по одному на строку, "домен=upstream":
+# caddy_sites = [
+#     "thin.example.com=http://127.0.0.1:8080",
+# ]
+# Сайты пишутся отдельными файлами в /opt/caddy/sites/*.caddy и подключаются
+# через import — новый сайт добавляется одним файлом, без правки Caddyfile.
+# Перечитать конфиг: docker exec caddy caddy reload --config /etc/caddy/Caddyfile

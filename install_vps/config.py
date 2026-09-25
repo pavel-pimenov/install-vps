@@ -39,6 +39,10 @@ class Config:
     journald_max_use: str = "100M"  # лимит systemd-журнала
     docker_log_max_size: str = "10m"  # размер одного файла лога контейнера
     docker_log_max_file: str = "3"    # сколько файлов лога хранить на контейнер
+    caddy: bool = False            # обратный прокси с автоматическим HTTPS (80/443)
+    caddy_email: str = ""          # e-mail для Let's Encrypt (уведомления об истечении)
+    caddy_domain: str = ""         # домен для Beszel Hub (нужен caddy + beszel)
+    caddy_sites: list[str] = field(default_factory=list)  # "домен=http://upstream"
 
 
 def load_config(path: Path | None) -> Config:
@@ -67,6 +71,10 @@ _OVERRIDES = (
     ("journald_max_use", "journald_max_use"),
     ("docker_log_max_size", "docker_log_max_size"),
     ("docker_log_max_file", "docker_log_max_file"),
+    ("caddy", "caddy"),
+    ("caddy_email", "caddy_email"),
+    ("caddy_domain", "caddy_domain"),
+    ("caddy_sites", "caddy_site"),
 )
 
 
