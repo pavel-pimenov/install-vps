@@ -4,6 +4,43 @@
 версионирование — [SemVer](https://semver.org/lang/ru/). Обратный
 хронологический порядок.
 
+## [0.3.0] — 2026-09-25
+
+### Добавлено
+
+- `ZRAM` — сжатый своп через пакет `systemd-zram-generator`:
+  `/etc/systemd/zram-generator.conf` (`zram-size`, `compression-algorithm = zstd`).
+  Активируется сразу (`/dev/zram0`, приоритет 100 — выше обычного swapfile) и
+  поднимается генератором при следующей загрузке. Включается `--zram-size-mb
+  256`; по умолчанию выключено (`0`), чтобы не менять поведение молча.
+- `JOURNALD_LIMIT` — лимит systemd-журнала через drop-in
+  `/etc/systemd/journald.conf.d/10-size-limit.conf` (`SystemMaxUse`,
+  `SystemKeepFree=200M`, `MaxRetentionSec=2week`) + `journalctl --vacuum-size`.
+  На 4 ГБ VPS журнал иначе съедает диск.
+- `DOCKER_LOGROTATE` — `log-driver=json-file` с `max-size`/`max-file` в
+  `/etc/docker/daemon.json`. JSON мерджится, а не перезаписывается: чужие ключи
+  (например `storage-driver`) сохраняются, невалидный файл не трогается ( docker
+  продолжает работать с прежней конфигурацией), рестарт `docker` — только при
+  фактическом изменении файла. Флаги: `--docker-log-max-size`, `--docker-log-max-file`.
+- Флаги `--zram-size-mb`, `--journald-max-use`, `--docker-log-max-size`,
+  `--docker-log-max-file` и одноимённые ключи `config.toml`.
+- `apply_overrides` переведён на таблицу `_OVERRIDES`: перекрытия конфига
+  флагами не размножаются по числу полей (ruff PLR0912).
+
+### Исправлено
+
+- **Критично: `KEYRING_CLEANUP` больше не сносит ядро, на котором работает.**
+  `apt-get purge --auto-remove` однажды удалил `linux-modules-*` и
+  `linux-image-*` текущего ядра: на хосте пропал `/lib/modules` целиком, в
+  `/boot` не осталось `vmlinuz`, то есть хост не перезагрузился бы. Текущее
+  ядро защищено точным списком (`grep -Fxv`), `--auto-remove` убран, а если
+  пакет образа текущего ядра отсутствует — он ставится заново, и наличие
+  `/boot/vmlinuz-$(uname -r)` проверяется с предупреждением.
+- `zram` без модуля ядра больше не валит скрипт: при недоступном
+  `/sys/block/zram0` выводится предупреждение «заработает после перезагрузки».
+- Литералы `{}` в python-фрагменте `DOCKER_LOGROTATE` экранированы
+  (`{{}}`) — иначе `.format()` считал их плейсхолдерами.
+
 ## [0.2.0] — 2026-09-25
 
 ### Добавлено

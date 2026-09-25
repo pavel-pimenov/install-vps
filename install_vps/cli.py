@@ -35,6 +35,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="публичный ключ агента Beszel (из веб-UI Hub: Add system)")
     p.add_argument("--beszel-token",
                    help="токен агента Beszel (из того же диалога Add system)")
+    p.add_argument("--zram-size-mb", type=int,
+                   help="размер zram-свопа в МБ, 0 — не трогать (по умолчанию 0)")
+    p.add_argument("--journald-max-use", metavar="SIZE",
+                   help="лимит systemd-журнала, напр. 100M (по умолчанию 100M)")
+    p.add_argument("--docker-log-max-size", metavar="SIZE",
+                   help="размер лога контейнера, напр. 10m (по умолчанию 10m)")
+    p.add_argument("--docker-log-max-file", metavar="N",
+                   help="число файлов лога на контейнер (по умолчанию 3)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 

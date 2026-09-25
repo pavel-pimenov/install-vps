@@ -18,3 +18,15 @@ accept_new = true             # автоматически добавить но
 # install-vps (повторный запуск идемпотентно добавит/пересоздаст агента).
 # beszel_agent_key = "ssh-ed25519 AAAA..."
 # beszel_agent_token = "xxxx-xxxx-xxxx-xxxx"
+
+# Сжатый своп zram поверх обычного swapfile. На VPS с 512M-1024M RAM заметно
+# отзывчивее: сначала уходит в zram (приоритет 100), swapfile — вторая ступень.
+# zram_size_mb = 256
+
+# Лимит systemd-журнала: /etc/systemd/journald.conf.d/10-size-limit.conf
+# journald_max_use = "100M"
+
+# Ротация логов контейнеров в /etc/docker/daemon.json (перезаписывает
+# log-driver/log-opts, остальные ключи файла сохраняются)
+# docker_log_max_size = "10m"
+# docker_log_max_file = "3"

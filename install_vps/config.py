@@ -35,6 +35,10 @@ class Config:
     beszel_port: int = 8090
     beszel_agent_key: str = ""      # публичный ключ агента (веб-UI Hub: Add system)
     beszel_agent_token: str = ""    # токен агента из того же диалога (обязателен в 0.20+)
+    zram_size_mb: int = 0          # размер zram-свопа в МБ (0 — выключить; докерится пакетом)
+    journald_max_use: str = "100M"  # лимит systemd-журнала
+    docker_log_max_size: str = "10m"  # размер одного файла лога контейнера
+    docker_log_max_file: str = "3"    # сколько файлов лога хранить на контейнер
 
 
 def load_config(path: Path | None) -> Config:
@@ -49,26 +53,32 @@ def load_config(path: Path | None) -> Config:
     return cfg
 
 
+_OVERRIDES = (
+    ("host", "host"),
+    ("user", "user"),
+    ("port", "port"),
+    ("key_path", "key"),
+    ("packages", "packages"),
+    ("beszel", "beszel"),
+    ("beszel_port", "beszel_port"),
+    ("beszel_agent_key", "beszel_key"),
+    ("beszel_agent_token", "beszel_token"),
+    ("zram_size_mb", "zram_size_mb"),
+    ("journald_max_use", "journald_max_use"),
+    ("docker_log_max_size", "docker_log_max_size"),
+    ("docker_log_max_file", "docker_log_max_file"),
+)
+
+
 def apply_overrides(cfg: Config, args) -> Config:
-    if args.host:
-        cfg.host = args.host
-    if args.user:
-        cfg.user = args.user
-    if args.port:
-        cfg.port = args.port
-    if args.key:
-        cfg.key_path = args.key
-    if args.packages:
-        cfg.packages = args.packages
+    for field_name, arg_name in _OVERRIDES:
+        value = getattr(args, arg_name)
+        # store_true даёт False, nargs — [], опции — None: пропускаем «пустое»,
+        # но 0 для zram_size_mb пропускать нельзя (0 = явно отключить zram)
+        if value is None or value is False or value in ([], ""):
+            continue
+        setattr(cfg, field_name, value)
     if args.sudo:
         cfg.sudo = True
-    if args.beszel:
-        cfg.beszel = True
-    if args.beszel_port:
-        cfg.beszel_port = args.beszel_port
-    if args.beszel_key:
-        cfg.beszel_agent_key = args.beszel_key
-    if args.beszel_token:
-        cfg.beszel_agent_token = args.beszel_token
     cfg.key_path = os.path.expanduser(cfg.key_path)
     return cfg

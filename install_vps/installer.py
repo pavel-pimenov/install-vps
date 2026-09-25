@@ -102,24 +102,150 @@ fi
 KEYRING_CLEANUP = r"""
 echo "==> чистим старые ядра (для малого места на диске)"
 CURRENT="$(uname -r)"
-# версионированные linux-image-* / linux-headers-* / linux-modules-*, кроме
-# пакета текущего ядра; мета-пакеты (linux-image-generic и др.) не трогаем
+# версионированные linux-image-* / linux-headers-* / linux-modules-*; пакеты
+# текущего ядра неприкосновенны (без них хост не перезагрузится)
+PROTECTED="$(printf 'linux-image-%s\nlinux-modules-%s\nlinux-headers-%s\nlinux-extra-%s' \
+  "$CURRENT" "$CURRENT" "$CURRENT" "$CURRENT")"
 OLD_KERNELS="$($SUDO dpkg -l 'linux-image-*' 'linux-headers-*' 'linux-modules-*' 2>/dev/null \
   | awk '/^ii/{print $2}' \
   | grep -E 'linux-(image|headers|modules)-[0-9]' \
-  | grep -v "linux-image-$CURRENT$" \
-  | grep -v "linux-modules-$CURRENT$" \
-  | grep -v "linux-headers-$CURRENT$" || true)"
+  | grep -Fxv -f <(printf '%s\n' "$PROTECTED") || true)"
 if [ -n "$OLD_KERNELS" ]; then
-  echo "$OLD_KERNELS" | xargs -r $SUDO apt-get purge -y --auto-remove
+  # без --auto-remove: autoremove однажды снёс модули и образ текущего ядра
+  echo "$OLD_KERNELS" | xargs -r $SUDO apt-get purge -y
 else
   echo "  старых ядер не найдено — нечего чистить"
+fi
+if ! $SUDO dpkg -s "linux-image-$CURRENT" >/dev/null 2>&1; then
+  echo "  ВОССТАНОВЛЕНИЕ: пакет ядра linux-image-$CURRENT отсутствует — ставим заново"
+  $SUDO apt-get install -y "linux-image-$CURRENT" "linux-modules-$CURRENT"
+fi
+if [ -e "/boot/vmlinuz-$CURRENT" ]; then
+  echo "  OK: /boot/vmlinuz-$CURRENT на месте (хост перезагрузится)"
+else
+  echo "  ВНИМАНИЕ: нет /boot/vmlinuz-$CURRENT — перезагрузка может не удаться!"
 fi
 echo "  осталось ядер: $($SUDO dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/{print $2}' | wc -l)"
 """
 
 BESZEL_DIR = "/opt/beszel"
 BESZEL_COMPOSE = "/opt/beszel/docker-compose.yml"
+
+JOURNALD_LIMIT = r"""
+echo "==> journald: ограничиваем размер журнала ({max_use})"
+$SUDO install -m 0755 -d /etc/systemd/journald.conf.d
+cat <<'JOURNALD_EOF' | $SUDO tee /etc/systemd/journald.conf.d/10-size-limit.conf >/dev/null
+[Journal]
+SystemMaxUse={max_use}
+SystemKeepFree={keep_free}
+MaxRetentionSec=2week
+JOURNALD_EOF
+$SUDO systemctl restart systemd-journald
+$SUDO journalctl --vacuum-size={max_use} >/dev/null 2>&1 || true
+echo "  $(grep -h '^SystemMaxUse' /etc/systemd/journald.conf.d/10-size-limit.conf)"
+du -sh /var/log/journal 2>/dev/null || true
+"""
+
+DOCKER_DAEMON_JSON = "/etc/docker/daemon.json"
+
+DOCKER_LOGROTATE = r"""
+echo "==> docker: ротация логов контейнеров ({max_size} x {max_file})"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  ВНИМАНИЕ: python3 не найден — настройка логов docker пропущена."
+else
+  $SUDO install -m 0755 -d /etc/docker
+  CHANGED="$($SUDO python3 - {daemon_json} "{max_size}" "{max_file}" <<'DOCKER_EOF_PY'
+import json
+import os
+import sys
+
+path, max_size, max_file = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = {{}}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+        if text:
+            cfg = json.loads(text)
+    if not isinstance(cfg, dict):
+        raise ValueError("not an object")
+    opts = dict(cfg.get("log-opts") or {{}})
+    opts["max-size"] = max_size
+    opts["max-file"] = max_file
+    updated = dict(cfg)
+    updated["log-driver"] = "json-file"
+    updated["log-opts"] = opts
+    if updated == cfg:
+        print("same")
+    else:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(updated, handle, indent=2)
+            handle.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        print("changed")
+except Exception as exc:
+    print("ERROR:" + str(exc))
+DOCKER_EOF_PY
+)"
+  case "$CHANGED" in
+    changed)
+      echo "  обновлён {daemon_json}: log-driver=json-file"
+      $SUDO systemctl restart docker
+      for _ in $(seq 1 30); do
+        if $SUDO docker info >/dev/null 2>&1; then break; fi
+        sleep 1
+      done
+      ;;
+    same)
+      echo "  {daemon_json} уже настроен — рестарт docker не требуется"
+      ;;
+    *)
+      echo "  ВНИМАНИЕ: {daemon_json} не перезаписан ($CHANGED)."
+      echo "  Проверьте файл вручную; действующая конфигурация docker не изменена."
+      ;;
+  esac
+fi
+"""
+
+ZRAM = r"""
+echo "==> zram: сжатый своп {size_mb}M (алгоритм zstd)"
+$SUDO apt-get install -y systemd-zram-generator
+$SUDO install -m 0755 -d /etc/systemd
+cat <<'ZRAM_EOF' | $SUDO tee /etc/systemd/zram-generator.conf >/dev/null
+[zram0]
+zram-size = {size_mb}M
+compression-algorithm = zstd
+ZRAM_EOF
+$SUDO systemctl daemon-reload
+if swapon --show=NAME --noheadings | grep -q '^/dev/zram'; then
+  echo "  zram уже активен, конфигурацию не трогаем"
+else
+  $SUDO modprobe zram 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    if [ -e /sys/block/zram0/disksize ]; then break; fi
+    sleep 1
+  done
+  if [ -e /sys/block/zram0/disksize ]; then
+    SIZE_BYTES=$(({size_mb} * 1024 * 1024))
+    CURRENT_BYTES="$(cat /sys/block/zram0/disksize)"
+    if [ "$CURRENT_BYTES" -ne "$SIZE_BYTES" ]; then
+      printf '%s\n' "$SIZE_BYTES" \
+        | $SUDO tee /sys/block/zram0/disksize >/dev/null
+    fi
+    printf '%s\n' zstd \
+      | $SUDO tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1 || true
+    $SUDO mkswap /dev/zram0 >/dev/null
+    $SUDO swapon -p 100 /dev/zram0
+    echo "  активирован /dev/zram0 (приоритет 100)"
+  else
+    echo "  ВНИМАНИЕ: /sys/block/zram0 недоступен — zram заработает после перезагрузки."
+  fi
+fi
+swapon --show
+echo "  при следующей загрузке zram поднимет systemd-zram-generator"
+"""
 
 BESZEL_STACK = r"""
 echo "==> Beszel Hub + Agent (docker compose, порт {port})"
@@ -266,8 +392,20 @@ def install(cfg: Config, host: RemoteHost) -> None:
     # иначе ("ubuntu"): docker.io/docker-compose-v2 уже в cfg.packages
     script += PKG_INSTALL.format(packages=" ".join(packages))
     script += SWAP512
+    script += JOURNALD_LIMIT.format(
+        max_use=cfg.journald_max_use,
+        keep_free="200M",
+    )
     script += LOGROTATE_COMPRESS
     script += KEYRING_CLEANUP
+    if cfg.zram_size_mb > 0:
+        script += ZRAM.format(size_mb=cfg.zram_size_mb)
+    if any(p.startswith("docker") for p in packages) or cfg.beszel:
+        script += DOCKER_LOGROTATE.format(
+            daemon_json=DOCKER_DAEMON_JSON,
+            max_size=cfg.docker_log_max_size,
+            max_file=cfg.docker_log_max_file,
+        )
     if cfg.beszel:
         for label, value in (
             ("beszel_agent_key", cfg.beszel_agent_key),
