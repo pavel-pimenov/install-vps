@@ -26,6 +26,37 @@ _DOCKER_OFFICIAL_PACKAGES = [
 
 _OS_RELEASE_FIELDS = 2
 
+# Утилиты, которых нет в репозиториях Ubuntu: ставим из релизов GitHub с
+# закреплённой версией и обязательной проверкой sha256 (checksums.txt).
+# {version} и {goarch} подставляются при сборке скрипта.
+_GITHUB_TOOLS = {
+    "lazydocker": {
+        "repo": "jesseduffield/lazydocker",
+        "version": "0.25.2",
+        "archive": "lazydocker_{version}_Linux_{goarch}.tar.gz",
+        "binary": "lazydocker",
+    },
+    "bandwhich": {
+        "repo": "imsodin/bandwhich",
+        "version": "0.23.2",
+        "archive": "bandwhich-{version}-linux-{goarch}.tar.gz",
+        "binary": "bandwhich",
+    },
+}
+
+# Утилиты, распространяемые готовым .deb: ставим через dpkg.
+_DEB_TOOLS = {
+    "systemd-manager-tui": {
+        "repo": "matheus-git/systemd-manager-tui",
+        "version": "1.2.5",
+        "package": "systemd-manager-tui_{version}_{debarch}.deb",
+        "binary": "systemd-manager-tui",
+        "dpkg_name": "systemd-manager-tui",
+    },
+}
+
+EXTRA_TOOLS = tuple(sorted(set(_GITHUB_TOOLS) | set(_DEB_TOOLS)))
+
 
 def _yaml_str(value: str) -> str:
     """Строка для YAML в docker-compose: кавычки, если есть спецсимволы."""

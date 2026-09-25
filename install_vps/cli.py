@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import apply_overrides, load_config
-from .installer import install, verify
+from .installer import EXTRA_TOOLS, install, verify
 from .ssh import RemoteHost
 
 
@@ -26,6 +26,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--packages", nargs="*",
                    help="список пакетов "
                         "(по умолчанию: nload htop btop mc git docker-compose-v2)")
+    p.add_argument("--tools", nargs="*", choices=sorted(EXTRA_TOOLS),
+                   metavar="TOOL",
+                   help="утилиты вне репозиториев Ubuntu, ставятся из релизов "
+                        "GitHub с проверкой sha256: "
+                        + ", ".join(sorted(EXTRA_TOOLS)))
     p.add_argument("--verify-only", action="store_true",
                    help="только проверить наличие пакетов, ничего не ставить")
     p.add_argument("--beszel", action="store_true",

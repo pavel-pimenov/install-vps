@@ -29,6 +29,7 @@ class Config:
     sudo: bool = False
     accept_new: bool = True
     packages: list[str] = field(default_factory=lambda: list(DEFAULT_PACKAGES))
+    tools: list[str] = field(default_factory=list)  # утилиты вне репозиториев Ubuntu
     swap_size_mb: int = 512
     docker_source: str = "ubuntu"   # "ubuntu" — docker.io из архивов Ubuntu; "official" — docker-ce
     beszel: bool = False            # поднять Beszel Hub+Agent одним docker-compose (порт 8090)
@@ -65,6 +66,7 @@ _OVERRIDES = (
     ("port", "port"),
     ("key_path", "key"),
     ("packages", "packages"),
+    ("tools", "tools"),
     ("beszel", "beszel"),
     ("beszel_port", "beszel_port"),
     ("beszel_agent_key", "beszel_key"),
