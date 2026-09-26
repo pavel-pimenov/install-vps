@@ -1,6 +1,7 @@
 [project]
 name = "install-vps"
-version = "0.1.0"
+# версия берётся из install_vps.__version__ — иначе она расходится с HISTORY
+dynamic = ["version"]
 description = "Автоматизация стартовой настройки новой VPS (Ubuntu 26.04) по SSH-ключу"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,6 +16,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["install_vps"]
+
+[tool.setuptools.dynamic]
+version = { attr = "install_vps.__version__" }
 
 [tool.ruff]
 target-version = "py311"

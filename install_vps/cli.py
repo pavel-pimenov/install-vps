@@ -31,6 +31,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="утилиты вне репозиториев Ubuntu, ставятся из релизов "
                         "GitHub с проверкой sha256: "
                         + ", ".join(sorted(EXTRA_TOOLS)))
+    p.add_argument("--swap-size-mb", type=int,
+                   help="размер файла подкачки в МБ, 0 — не трогать (по умолчанию 512)")
+    p.add_argument("--docker-source", choices=("ubuntu", "official"),
+                   help="источник docker: ubuntu (docker.io, по умолчанию) "
+                        "или official (docker-ce с download.docker.com)")
     p.add_argument("--verify-only", action="store_true",
                    help="только проверить наличие пакетов, ничего не ставить")
     p.add_argument("--beszel", action="store_true",
@@ -45,6 +50,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--beszel-disable-password-auth", action="store_true",
                    help="вход только через OAuth, пароль отключить "
                         "(включайте лишь после проверки, что OAuth работает — иначе логин потерян)")
+    p.add_argument("--beszel-path", metavar="PATH",
+                   help="путь плитки Beszel на портале (по умолчанию /monitor)")
     p.add_argument("--zram-size-mb", type=int,
                    help="размер zram-свопа в МБ, 0 — не трогать (по умолчанию 0)")
     p.add_argument("--journald-max-use", metavar="SIZE",
@@ -62,6 +69,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--caddy-site", metavar="DOMAIN=UPSTREAM", action="append",
                    help="любой сайт: monitor.example.com=http://127.0.0.1:8080 "
                         "(можно указать несколько раз)")
+    p.add_argument("--caddy-portal", metavar="DOMAIN",
+                   help="домен страницы с плитками сервисов: HTTPS сам, "
+                        "плитки ведут на сервисы этого сервера")
+    p.add_argument("--caddy-portal-title", metavar="TITLE",
+                   help="заголовок страницы плиток (по умолчанию «Сервисы»)")
+    p.add_argument("--caddy-tile", metavar="TILE", action="append",
+                   help="плитка портала: Мониторинг=/monitor=127.0.0.1:8090 "
+                        "(префикс срезается), или Мониторинг=https://домен "
+                        "для внешней ссылки (можно указать несколько раз)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 

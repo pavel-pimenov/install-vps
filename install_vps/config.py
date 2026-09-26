@@ -46,6 +46,11 @@ class Config:
     caddy_email: str = ""          # e-mail для Let's Encrypt (уведомления об истечении)
     caddy_domain: str = ""         # домен для Beszel Hub (нужен caddy + beszel)
     caddy_sites: list[str] = field(default_factory=list)  # "домен=http://upstream"
+    caddy_portal: str = ""         # домен страницы с плитками сервисов
+    caddy_portal_title: str = "Сервисы"  # заголовок страницы плиток
+    caddy_tiles: list[str] = field(default_factory=list)
+    # "Название=/путь=upstream" (префикс срезается) либо "Название=https://домен"
+    beszel_path: str = "/monitor"   # путь плитки Beszel на портале
 
 
 def load_config(path: Path | None) -> Config:
@@ -67,12 +72,15 @@ _OVERRIDES = (
     ("key_path", "key"),
     ("packages", "packages"),
     ("tools", "tools"),
+    ("swap_size_mb", "swap_size_mb"),
+    ("docker_source", "docker_source"),
     ("beszel", "beszel"),
     ("beszel_port", "beszel_port"),
     ("beszel_agent_key", "beszel_key"),
     ("beszel_agent_token", "beszel_token"),
     ("beszel_user_creation", "beszel_user_creation"),
     ("beszel_disable_password_auth", "beszel_disable_password_auth"),
+    ("beszel_path", "beszel_path"),
     ("zram_size_mb", "zram_size_mb"),
     ("journald_max_use", "journald_max_use"),
     ("docker_log_max_size", "docker_log_max_size"),
@@ -81,6 +89,9 @@ _OVERRIDES = (
     ("caddy_email", "caddy_email"),
     ("caddy_domain", "caddy_domain"),
     ("caddy_sites", "caddy_site"),
+    ("caddy_portal", "caddy_portal"),
+    ("caddy_portal_title", "caddy_portal_title"),
+    ("caddy_tiles", "caddy_tile"),
 )
 
 

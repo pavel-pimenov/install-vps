@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import html
 import re
 import subprocess
+from dataclasses import dataclass
 
 from .config import Config
 from .ssh import RemoteHost
@@ -26,36 +28,60 @@ _DOCKER_OFFICIAL_PACKAGES = [
 
 _OS_RELEASE_FIELDS = 2
 
-# Утилиты, которых нет в репозиториях Ubuntu: ставим из релизов GitHub с
-# закреплённой версией и обязательной проверкой sha256 (checksums.txt).
-# {version} и {goarch} подставляются при сборке скрипта.
+# Утилиты, которых нет в репозиториях Ubuntu: ставим из релизов GitHub.
+# Версия, имя файла и sha256 закреплены здесь же: релиз нельзя перезалить
+# незаметно, а молча ставить непроверенные бинарники нельзя тем более.
+#   * sha256   — sha256 архива, сверяется на хосте до распаковки;
+#   * bin_sha256 — sha256 самого бинарника: по нему дешевле и надёжнее
+#     проверять, что нужная версия уже стоит (не качать архив заново).
+# Набор архетипур у каждого проекта свой, поэтому и url, и хеши заданы
+# по ключам uname -m.
 _GITHUB_TOOLS = {
     "lazydocker": {
-        "repo": "jesseduffield/lazydocker",
         "version": "0.25.2",
-        "archive": "lazydocker_{version}_Linux_{goarch}.tar.gz",
+        "url": "https://github.com/jesseduffield/lazydocker/releases/download/v{version}",
+        "archive": "lazydocker_{version}_Linux_{arch}.tar.gz",
         "binary": "lazydocker",
+        "arch": {
+            "x86_64": "x86_64",
+            "aarch64": "arm64",
+            "armv7l": "armv7",
+            "armv6l": "armv6",
+        },
+        "sha256": {
+            "x86_64": "0d9dbfc26068b218e7ed84b104748cadc6e3cf733c0afd35465306fb39b9523c",
+            "aarch64": "005c38b685aaa557e7d646d83a3dadb5024340eeed8c6a2e1949eee6f530de23",
+            "armv7l": "7a12a63fd39fdbb84b41db14824822f2ce38a549b744ddb5647587ec3aa4cf2e",
+            "armv6l": "b03e75ca588e788414385770de09952c7a1f4a852c7ad78a9feea7462991e940",
+        },
+        "bin_sha256": {
+            "x86_64": "fa14fba9f56266e6b1e6374b6ee477fcd5d7858915eb603e8e77ac577ce14a2c",
+            "aarch64": "4fd56feb3987c4a0b1dd0e8a756a99ab311dcb2ed16371e62250becd4d88916d",
+            "armv7l": "4ca5d6330db66a6094bd30ea87d5b353d1d32958d4b90389e0ff754f9c089cb9",
+            "armv6l": "0a2ed07ede47c70e621fdac6c626bc2f2470ed8676a898e07722fac9a1435053",
+        },
     },
     "bandwhich": {
-        "repo": "imsodin/bandwhich",
-        "version": "0.23.2",
-        "archive": "bandwhich-{version}-linux-{goarch}.tar.gz",
+        "version": "0.23.1",
+        "url": "https://github.com/imsnif/bandwhich/releases/download/v{version}",
+        "archive": "bandwhich-v{version}-{arch}-unknown-linux-gnu.tar.gz",
         "binary": "bandwhich",
+        "arch": {
+            "x86_64": "x86_64",
+            "aarch64": "aarch64",
+        },
+        "sha256": {
+            "x86_64": "0de12665fcd1ecafbed84c372fb8edc568bb9eaffee95f53710b8c0b4c687637",
+            "aarch64": "46311a6e2652fc3fc386c1186baa6b986e925c686237434445b656112358ce4d",
+        },
+        "bin_sha256": {
+            "x86_64": "d18d24df363458669b9a54ff247356e953e55fa78220736b85eee2da2052f0df",
+            "aarch64": "8783c00b09627ec1644d223bddf0874a90dfa4cfad496fb25a7003f7d95006f5",
+        },
     },
 }
 
-# Утилиты, распространяемые готовым .deb: ставим через dpkg.
-_DEB_TOOLS = {
-    "systemd-manager-tui": {
-        "repo": "matheus-git/systemd-manager-tui",
-        "version": "1.2.5",
-        "package": "systemd-manager-tui_{version}_{debarch}.deb",
-        "binary": "systemd-manager-tui",
-        "dpkg_name": "systemd-manager-tui",
-    },
-}
-
-EXTRA_TOOLS = tuple(sorted(set(_GITHUB_TOOLS) | set(_DEB_TOOLS)))
+EXTRA_TOOLS = tuple(sorted(_GITHUB_TOOLS))
 
 
 def _yaml_str(value: str) -> str:
@@ -77,6 +103,83 @@ _HOSTNAME_RE = re.compile(
 )
 _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _tool_script(name: str) -> str:
+    """bash-фрагмент установки утилиты из GitHub-релиза.
+
+    Подстановки делаются здесь, а не через .format(): в готовом bash много
+    $ и скобок, которые .format() либо испортил бы, либо пришлось бы
+    экранировать. Каждая утилита ставится в своем подшелле, чтобы её
+    `trap ... EXIT` убирал временный каталог и не задевал основной скрипт.
+    """
+    spec = _GITHUB_TOOLS[name]
+    version = spec["version"]
+    binary = spec["binary"]
+    base_url = spec["url"].format(version=version)
+    cases = []
+    for machine, arch in spec["arch"].items():
+        if machine not in spec["sha256"] or machine not in spec["bin_sha256"]:
+            continue
+        archive = spec["archive"].format(version=version, arch=arch)
+        cases.append(
+            f"    {machine}) FILE={_sh_quote(archive)}"
+            f" URL={_sh_quote(f'{base_url}/{archive}')}"
+            f" SHA={_sh_quote(spec['sha256'][machine])}"
+            f" BIN_SHA={_sh_quote(spec['bin_sha256'][machine])} ;;"
+        )
+    return (
+        f'echo "==> утилита {name} {version} (GitHub release, sha256) "\n'
+        "(\n"
+        f"  BIN={_sh_quote(binary)}\n"
+        '  ARCH="$(uname -m)"\n'
+        '  case "$ARCH" in\n'
+        + "\n".join(cases)
+        + "\n"
+        f'    *) echo "  ПРОПУСК: {name} не собран под $ARCH"; exit 0 ;;\n'
+        "  esac\n"
+        '  if [ -x "/usr/local/bin/$BIN" ] && '
+        '[ "$(sha256sum "/usr/local/bin/$BIN" | cut -d" " -f1)" = "$BIN_SHA" ]; then\n'
+        f'    echo "  {binary} {version} уже стоит (sha256 бинарника совпал) — пропускаю"\n'
+        "    exit 0\n"
+        "  fi\n"
+        '  TMP="$(mktemp -d)"\n'
+        "  trap 'rm -rf \"$TMP\"' EXIT\n"
+        '  echo "  скачиваю $URL"\n'
+        '  curl -fsSL --retry 3 -o "$TMP/tool.tar.gz" "$URL"\n'
+        '  echo "$SHA  $TMP/tool.tar.gz" | sha256sum -c - >/dev/null || {\n'
+        f'    echo "ОШИБКА: sha256 архива не совпал ({name} {version})" >&2; exit 1; }}\n'
+        '  tar xzf "$TMP/tool.tar.gz" -C "$TMP"\n'
+        '  SRC="$(find "$TMP" -type f -name "$BIN" | head -1)"\n'
+        '  if [ -z "$SRC" ]; then\n'
+        f'    echo "ОШИБКА: в архиве нет файла {binary}" >&2; exit 1\n'
+        "  fi\n"
+        '  $SUDO install -m 0755 "$SRC" "/usr/local/bin/$BIN"\n'
+        '  echo "  $BIN: $(timeout 5 /usr/local/bin/"$BIN" --version </dev/null 2>&1 | head -1)"\n'
+        ")\n"
+    )
+
+
+def _tools_script(tools: list[str]) -> str:
+    """Фрагменты установки всех выбранных утилит, по одной на инструмент."""
+    return "".join(_tool_script(name) for name in tools)
+
+
+def _tools_verify_script(tools: list[str]) -> str:
+    """Проверка наличия утилит (работает и в --verify-only)."""
+    lines = ['echo "==> утилиты из GitHub-релизов"']
+    for name in tools:
+        binary = _GITHUB_TOOLS[name]["binary"]
+        version = _GITHUB_TOOLS[name]["version"]
+        lines.append(
+            f"if [ -x /usr/local/bin/{binary} ]; then\n"
+            f'  echo "  OK: {name} {version}'
+            f' -> $(timeout 5 /usr/local/bin/{binary} --version </dev/null 2>&1 | head -1)"\n'
+            f"else\n"
+            f'  echo "  MISSING: {name} {version}"\n'
+            f"fi"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _beszel_auth_env(cfg: Config) -> str:
@@ -129,21 +232,35 @@ def _caddy_beszel_block(domain: str, port: int) -> str:
 
 
 def _caddy_caddyfile(email: str) -> str:
-    """Корневой Caddyfile: глобальные опции + подключение всех сайтов."""
+    """Корневой Caddyfile: глобальные опции + подключение всех сайтов.
+
+    Без завершающего перевода строки: строка-заглушка в шаблоне и heredoc уже
+    добавляют перевод, а лишняя пустая строка в конце заставляет Caddy
+    ругаться «Caddyfile input is not formatted» при каждом старте.
+    """
     lines = ["{"]
     if email:
         lines.append(f"\temail {email}")
     lines.append("}")
     lines.append(f"import {CADDY_SITES_DIR_IN_CONTAINER}/*.caddy")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines)
 
 
-def _caddy_sites_script(cfg: Config) -> str:
-    """Готовые bash-фрагменты, создающие по файлу на каждый сайт.
+def _write_site_script(name: str, content: str) -> str:
+    """Один сайт = один файл в sites/, подключается через import в Caddyfile.
 
-    Содержимое файлов не проходит через .format(), поэтому фигурные скобки
-    Caddyfile не нужно экранировать.
+    Содержимое не проходит через .format(), поэтому фигурные скобки
+    Caddyfile экранировать не нужно.
     """
+    return (
+        f"cat <<'CADDY_SITE_EOF' | $SUDO tee {CADDY_SITES_DIR}/{name}.caddy >/dev/null\n"
+        f"{content}"
+        "CADDY_SITE_EOF\n"
+    )
+
+
+def _caddy_sites_script(cfg: Config, portal: bool = False) -> str:
+    """Готовые bash-фрагменты, создающие по файлу на каждый сайт."""
     sites: list[tuple[str, str]] = []
     if cfg.caddy_domain:
         sites.append(("beszel", _caddy_beszel_block(cfg.caddy_domain, cfg.beszel_port)))
@@ -160,14 +277,8 @@ def _caddy_sites_script(cfg: Config) -> str:
             raise ValueError(f"Некорректный upstream в caddy_site: {upstream!r}")
         sites.append((domain, _caddy_site_block(domain, upstream)))
 
-    script = ""
-    for name, content in sites:
-        script += (
-            f"cat <<'CADDY_SITE_EOF' | $SUDO tee {CADDY_SITES_DIR}/{name}.caddy >/dev/null\n"
-            f"{content}"
-            "CADDY_SITE_EOF\n"
-        )
-    if not sites:
+    script = "".join(_write_site_script(name, content) for name, content in sites)
+    if not sites and not portal:
         script += (
             'echo "  ВНИМАНИЕ: не задан ни одного домена — Caddy поднимется,'
             ' но сайтов не будет."\n'
@@ -175,6 +286,331 @@ def _caddy_sites_script(cfg: Config) -> str:
             ' --caddy-site ДОМЕН=UPSTREAM."\n'
         )
     return script
+
+
+# --------------------------------------------------------------------------
+# Портал: страница с плитками сервисов на своём домене.
+#
+# Одна страница https://<домен>/ — список плиток; каждая плитка ведёт либо на
+# путь этого же домена (Caddy проксирует его на локальный сервис), либо на
+# внешний адрес. Новый сервис = новая строка в caddy_tiles, Caddyfile руками
+# править не нужно.
+# --------------------------------------------------------------------------
+_PORTAL_PATH_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$")
+_EXTERNAL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+# сколько полей в caddy_tile: "Название=адрес", "Название=/путь=upstream",
+# "Название=/путь=upstream=strip|keep"
+_TILE_FIELDS_EXTERNAL = 2
+_TILE_FIELDS_PROXY = 3
+_TILE_FIELDS_WITH_MODE = 4
+
+_PORTAL_CSS = """
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; display: flex; align-items: center;
+  justify-content: center; padding: 2rem 1rem;
+  background: #0f1216; color: #e6e9ef;
+  font: 16px/1.5 -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+}
+main { width: 100%; max-width: 60rem; }
+h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 1.5rem; letter-spacing: .01em; }
+ul { list-style: none; margin: 0; padding: 0; display: grid; gap: .9rem;
+     grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); }
+.tile {
+  display: flex; flex-direction: column; gap: .3rem; padding: 1.1rem 1.2rem;
+  border: 1px solid #232a33; border-radius: .7rem; background: #161b22;
+  color: inherit; text-decoration: none; transition: border-color .15s, transform .15s;
+}
+.tile:hover, .tile:focus-visible { border-color: #3d82f6; transform: translateY(-2px); }
+.name { font-size: 1.05rem; font-weight: 600; }
+.hint { font-size: .82rem; color: #8b949e; word-break: break-all; }
+footer { margin-top: 1.6rem; font-size: .8rem; color: #6e7681; }
+"""
+
+
+@dataclass
+class Tile:
+    """Плитка портала: подпись + адрес, который открывает браузер."""
+
+    name: str
+    href: str
+    hint: str
+    path: str = ""        # путь на портале; "" — внешняя ссылка, прокси не нужен
+    upstream: str = ""     # что проксировать на этот путь
+    keep_prefix: bool = False  # True — не срезать префикс (приложение знает базу)
+    beszel: bool = False
+
+
+def _external_url(raw: str) -> str:
+    """Внешний адрес плитки: только http(s) с валидным хостом.
+
+    Всё остальное (mailto:, javascript:, //host) отбрасываем: адрес попадает
+    в href генерируемой страницы.
+    """
+    if not _EXTERNAL_RE.match(raw):
+        raise ValueError(
+            f"Внешний адрес плитки должен быть http(s)-ссылкой, а получено {raw!r}"
+        )
+    if any(ch in raw for ch in " \t\n\r"):
+        raise ValueError(f"Пробелы в адресе плитки недопустимы: {raw!r}")
+    authority = raw.split("://", 1)[1].split("/", 1)[0]
+    host = authority.rsplit(":", 1)[0] if authority.count(":") == 1 else authority
+    if not _HOSTNAME_RE.match(host):
+        raise ValueError(f"Некорректный хост в адресе плитки: {host!r}")
+    return raw
+
+
+def _parse_tile(raw: str, portal: str) -> Tile:
+    """Плитка из строки конфига.
+
+    Формы:
+      НАЗВАНИЕ=https://домен           — внешняя ссылка, только клик по плитке
+      НАЗВАНИЕ=/путь=upstream          — прокси на локальный сервис, префикс
+                                         срезается (приложение видит "/")
+      НАЗВАНИЕ=/путь=upstream=keep     — то же, но префикс остаётся
+    """
+    parts = [part.strip() for part in raw.split("=")]
+    if len(parts) < _TILE_FIELDS_EXTERNAL or not parts[0]:
+        raise ValueError(
+            "caddy_tile должен быть вида НАЗВАНИЕ=/путь=upstream "
+            "(например Мониторинг=/monitor=127.0.0.1:8090) "
+            "или НАЗВАНИЕ=https://домен для внешней ссылки, "
+            f"а получено {raw!r}"
+        )
+    name = parts[0]
+    if any(ch in name for ch in "\n\r") or "<" in name or ">" in name:
+        raise ValueError(f"Недопустимое название плитки: {name!r}")
+    if len(parts) == _TILE_FIELDS_EXTERNAL:
+        href = _external_url(parts[1])
+        return Tile(name=name, href=href, hint=href.split("://", 1)[1])
+
+    if len(parts) == _TILE_FIELDS_PROXY:
+        path, upstream, mode = parts[1], parts[2], "strip"
+    elif len(parts) == _TILE_FIELDS_WITH_MODE:
+        path, upstream, mode = parts[1], parts[2], parts[3].lower()
+        if mode not in ("strip", "keep"):
+            raise ValueError(
+                f"Четвёртое поле плитки — strip или keep, а получено {mode!r}"
+            )
+    else:
+        raise ValueError(
+            f"Слишком много полей в caddy_tile ({len(parts)}): {raw!r}; "
+            "ожидается НАЗВАНИЕ=/путь=upstream[=strip|keep]"
+        )
+    if not _PORTAL_PATH_RE.match(path):
+        raise ValueError(
+            f"Путь плитки должен быть вида /имя (без пробелов, не «/»): {path!r}"
+        )
+    if not _UPSTREAM_RE.match(upstream):
+        raise ValueError(f"Некорректный upstream плитки: {upstream!r}")
+    return Tile(
+        name=name,
+        href=f"https://{portal}{path}/",
+        hint=f"{portal}{path}",
+        path=path,
+        upstream=upstream,
+        keep_prefix=mode == "keep",
+    )
+
+
+def _beszel_path(cfg: Config) -> str:
+    return "/" + cfg.beszel_path.strip("/")
+
+
+def _beszel_public_url(cfg: Config) -> str:
+    """Публичный адрес Beszel Hub: APP_URL и подсказки в выводе."""
+    if cfg.caddy and cfg.caddy_domain:
+        return f"https://{cfg.caddy_domain}"
+    if cfg.caddy and cfg.caddy_portal:
+        return f"https://{cfg.caddy_portal}{_beszel_path(cfg)}"
+    return f"http://localhost:{cfg.beszel_port}"
+
+
+def _tiles(cfg: Config) -> list[Tile]:
+    """Плитки портала: из конфига + автоплитка мониторинга.
+
+    Плитка Beszel появляется сама, когда Caddy включён, домен портала задан, а
+    для Beszel не выделен отдельный домен (caddy_domain) — иначе он жил бы
+    вне портала, и ссылаться на него нужно было бы отдельной строкой.
+    """
+    tiles = [_parse_tile(raw, cfg.caddy_portal) for raw in cfg.caddy_tiles]
+    if cfg.beszel and cfg.caddy and cfg.caddy_portal and not cfg.caddy_domain:
+        path = _beszel_path(cfg)
+        tiles.insert(
+            0,
+            Tile(
+                name="Мониторинг",
+                href=f"https://{cfg.caddy_portal}{path}/",
+                hint=f"{cfg.caddy_portal}{path}",
+                path=path,
+                upstream=f"127.0.0.1:{cfg.beszel_port}",
+                beszel=True,
+            ),
+        )
+    paths = [tile.path for tile in tiles if tile.path]
+    for path in paths:
+        for other in paths:
+            if path != other and (other.startswith(f"{path}/") or path.startswith(f"{other}/")):
+                raise ValueError(
+                    f"Пути плиток вложены друг в друга ({path!r} и {other!r}): "
+                    "handle_path в Caddy выбрал бы внешний путь первым"
+                )
+    if len(set(paths)) != len(paths):
+        raise ValueError("Пути плиток повторяются: плитка на такой путь уже есть")
+    return tiles
+
+
+def _portal_caddy_block(cfg: Config, tiles: list[Tile]) -> str:
+    """Сайт портала: раздача index.html + прокси плиток по путям.
+
+    Всё внутри handle-блоков: иначе Caddy сортирует директивы по своему
+    внутреннему порядку, и catch-all с index.html может отрезать прокси.
+    """
+    lines = [
+        f"{cfg.caddy_portal} {{",
+        "\tencode gzip zstd",
+        "\trequest_body {",
+        "\t\tmax_size 10MB",
+        "\t}",
+    ]
+    for tile in tiles:
+        if not tile.path:
+            continue
+        # без завершающего слэша Caddy отдал бы 404, а не приложение.
+        # `redir * путь 308`, а не `redir путь 308`: у redir первый позиционный
+        # аргумент — матчер, поэтому без `*` редиректом стал бы сам путь.
+        lines += [
+            f"\thandle {tile.path} {{",
+            f"\t\tredir * {tile.path}/ 308",
+            "\t}",
+        ]
+        keyword = "handle" if tile.keep_prefix else "handle_path"
+        lines.append(f"\t{keyword} {tile.path}/* {{")
+        if tile.beszel:
+            # настройки из документации beszel.dev: импорт/экспорт систем
+            lines += [
+                f"\t\treverse_proxy {tile.upstream} {{",
+                "\t\t\ttransport http {",
+                "\t\t\t\tread_timeout 360s",
+                "\t\t\t}",
+                "\t\t}",
+            ]
+        else:
+            lines.append(f"\t\treverse_proxy {tile.upstream}")
+        lines.append("\t}")
+    lines += [
+        "\thandle {",
+        f"\t\troot * {PORTAL_ROOT_IN_CONTAINER}",
+        "\t\tfile_server",
+        "\t}",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _portal_html(cfg: Config, tiles: list[Tile]) -> str:
+    """Самодостаточная страница плиток: без внешних шрифтов и скриптов."""
+    title = (cfg.caddy_portal_title or "Сервисы").strip() or "Сервисы"
+    if any(ch in title for ch in "\n\r<"):
+        raise ValueError(f"Недопустимый заголовок портала: {cfg.caddy_portal_title!r}")
+    items = "".join(
+        '    <li><a class="tile" href="{href}">'
+        '<span class="name">{name}</span>'
+        '<span class="hint">{hint}</span></a></li>\n'.format(
+            href=html.escape(tile.href, quote=True),
+            name=html.escape(tile.name),
+            hint=html.escape(tile.hint),
+        )
+        for tile in tiles
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="ru">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<meta name="color-scheme" content="dark">\n'
+        '<meta name="robots" content="noindex">\n'
+        f"<title>{html.escape(title)}</title>\n"
+        f"<style>{_PORTAL_CSS}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        "<main>\n"
+        f"  <h1>{html.escape(title)}</h1>\n"
+        f"  <ul>\n{items}  </ul>\n"
+        f"  <footer>{html.escape(cfg.caddy_portal)}</footer>\n"
+        "</main>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def _portal_script(cfg: Config, tiles: list[Tile]) -> str:
+    """Портал на хосте: каталог, index.html и файл сайта для Caddy."""
+    if not tiles:
+        return (
+            'echo "  ВНИМАНИЕ: портал включён, но плиток нет — будет пустая страница."\n'
+            'echo "  Добавьте --caddy-tile НАЗВАНИЕ=/путь=upstream."\n'
+        )
+    return (
+        _write_site_script("portal", _portal_caddy_block(cfg, tiles))
+        + f"echo \"==> портал {cfg.caddy_portal}: страница плиток\"\n"
+        + f"$SUDO install -m 0755 -d {PORTAL_DIR}\n"
+        + f"cat <<'PORTAL_EOF' | $SUDO tee {PORTAL_INDEX} >/dev/null\n"
+        + _portal_html(cfg, tiles)
+        + "PORTAL_EOF\n"
+        + f'echo "  плиток: {len(tiles)}"\n'
+    )
+
+
+def _portal_verify_script(cfg: Config, tiles: list[Tile]) -> str:
+    """Проверка портала: страница отдаётся и каждая плитка отвечает.
+
+    Caddy работает в network_mode: host, поэтому 127.0.0.1:443 — это его же
+    порт: --resolve подставляет имя для SNI и Host, а -k отключает проверку
+    сертификата (Let's Encrypt на первом запросе мог ещё не выпустить его).
+    """
+    domain = cfg.caddy_portal
+    lines = [f'echo "==> портал плиток: {domain}"']
+    if not tiles:
+        lines.append('  echo "  плиток нет"')
+        return "\n".join(lines) + "\n"
+
+    def probe(url: str) -> str:
+        return (
+            f"$($SUDO curl -sk -o /dev/null -w '%{{http_code}}' --resolve "
+            f"{domain}:443:127.0.0.1 {url} 2>/dev/null || true)"
+        )
+
+    lines += [
+        f'CODE="{probe(f"https://{domain}/")}"',
+        '[ -n "$CODE" ] || CODE=000',
+        'case "$CODE" in',
+        "  200) echo '  OK: страница плиток отдаётся' ;;",
+        "  *) echo \"  MISSING: страница плиток не отдаётся (код $CODE)\" ;;",
+        "esac",
+    ]
+    for tile in tiles:
+        if not tile.path:
+            lines.append(
+                f'  echo "  плитка {tile.name}: внешняя ссылка {tile.href}"'
+            )
+            continue
+        target = f"https://{domain}{tile.path}/"
+        lines += [
+            f'CODE="{probe(target)}"',
+            '[ -n "$CODE" ] || CODE=000',
+            'case "$CODE" in',
+            "  2??|3??) echo '  OK: плитка " + tile.name + " -> " + tile.path
+            + "/ ($CODE)' ;;",
+            "  000|502|503|504) echo \"  WARN: " + tile.name + " не отвечает ("
+            + tile.upstream + ", код $CODE)\" ;;",
+            "  *) echo \"  WARN: " + tile.name + " ответил кодом $CODE\" ;;",
+            "esac",
+        ]
+    return "\n".join(lines) + "\n"
 
 
 def _bootstrap(sudo: bool) -> str:
@@ -216,11 +652,11 @@ echo "==> apt-get update (после добавления docker-репо)"
 $SUDO apt-get update
 """
 
-SWAP512 = r"""
-echo "==> своп-файл 512M (для слабых VPS)"
+SWAP = r"""
+echo "==> своп-файл {size_mb}M (для слабых VPS)"
 if ! $SUDO swapon --show | grep -q '^/swapfile'; then
   if [ ! -f /swapfile ]; then
-    $SUDO dd if=/dev/zero of=/swapfile bs=1M count=512 status=none
+    $SUDO dd if=/dev/zero of=/swapfile bs=1M count={size_mb} status=none
     $SUDO chmod 600 /swapfile
     $SUDO mkswap /swapfile
   fi
@@ -312,6 +748,10 @@ CADDY_SITES_DIR = "/opt/caddy/sites"
 # внутри контейнера sites/ примонтирован в /etc/caddy/sites — Caddyfile
 # пишется и читается уже по контейнерному пути
 CADDY_SITES_DIR_IN_CONTAINER = "/etc/caddy/sites"
+# портал: генерируемая страница плиток, отдаётся как статика
+PORTAL_DIR = "/opt/caddy/portal"
+PORTAL_INDEX = f"{PORTAL_DIR}/index.html"
+PORTAL_ROOT_IN_CONTAINER = "/srv/portal"
 
 JOURNALD_LIMIT = r"""
 echo "==> journald: ограничиваем размер журнала ({max_use})"
@@ -501,7 +941,7 @@ echo "  после перезагрузки zram поднимет zram-swap.serv
 BESZEL_STACK = r"""
 echo "==> Beszel Hub + Agent (docker compose, порт {port})"
 $SUDO install -m 0755 -d {dir}
-cat <<'BESZEL_EOF' | $SUDO tee {compose} >/dev/null
+{key_read}cat <<'BESZEL_EOF' | $SUDO tee {compose} >/dev/null
 services:
   beszel:
     image: henrygd/beszel:latest
@@ -530,24 +970,25 @@ services:
       KEY: "{key}"
       TOKEN: "{token}"
 BESZEL_EOF
-{auth_warning}if [ -z {key_quoted} ]; then
-  echo "  ВНИМАНИЕ: не задан beszel_agent_key — агент не сможет подключиться к Hub."
+{key_fix}{auth_warning}if [ -z {key_quoted} ]; then
+  echo "  ВНИМАНИЕ: не задан beszel_agent_key — новый агент не сможет подключиться."
   echo "  Откройте http://<host>:{port} -> создайте пользователя -> Add system,"
   echo "  скопируйте ключ агента в beszel_agent_key (config.toml или --beszel-key)"
   echo "  и запустите install-vps повторно."
 fi
 if [ -z {token_quoted} ]; then
-  echo "  ВНИМАНИЕ: не задан beszel_agent_token — агент не сможет подключиться к Hub."
+  echo "  ВНИМАНИЕ: не задан beszel_agent_token — новый агент не сможет подключиться."
   echo "  Токен виден в том же диалоге Add system (или в настройках -> tokens)."
 fi
 $SUDO docker compose -f {compose} up -d --remove-orphans
 $SUDO docker compose -f {compose} ps
-echo "  Hub: http://<host>:{port}"
+echo "  Hub (внутренний): http://localhost:{port}"
+echo "  Hub (публичный): {public_url}"
 """
 
 CADDY = r"""
 echo "==> Caddy: обратный прокси с автоматическим HTTPS (порты 80/443)"
-$SUDO install -m 0755 -d {dir} {sites_dir}
+$SUDO install -m 0755 -d {dir} {sites_dir} {portal_dir}
 cat <<'CADDY_COMPOSE_EOF' | $SUDO tee {compose} >/dev/null
 services:
   caddy:
@@ -560,6 +1001,7 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./sites:/etc/caddy/sites:ro
+      - ./portal:/srv/portal:ro
       - caddy_data:/data
       - caddy_config:/config
     logging:
@@ -638,11 +1080,6 @@ for cmd in nload htop btop mc git vmstat; do
     echo "  MISSING: $cmd"
   fi
 done
-if command -v vmstat >/dev/null 2>&1; then
-  echo "  OK: vmstat -> $(command -v vmstat)"
-else
-  echo "  MISSING: vmstat"
-fi
 if command -v fail2ban-client >/dev/null 2>&1; then
   echo "  OK: fail2ban -> $(command -v fail2ban-client)"
 elif $SUDO systemctl is-active fail2ban >/dev/null 2>&1; then
@@ -704,8 +1141,117 @@ def _codename(cfg: Config, host: RemoteHost) -> str:
     return codename
 
 
+def _validate(cfg: Config) -> list[Tile]:
+    """Проверки, которые обязаны случиться до отправки скрипта на хост.
+
+    Ошибка в конфиге (домен, upstream, путь плитки) не должна оставлять хост
+    наполовину настроенным, поэтому всё это проверяется на стороне Python.
+    """
+    if cfg.beszel and cfg.caddy and cfg.caddy_portal:
+        path = _beszel_path(cfg)
+        if not _PORTAL_PATH_RE.match(path):
+            raise ValueError(f"Некорректный beszel_path: {cfg.beszel_path!r}")
+    if cfg.caddy_portal and not _HOSTNAME_RE.match(cfg.caddy_portal):
+        raise ValueError(f"Некорректный домен портала: {cfg.caddy_portal!r}")
+    for name in cfg.tools:
+        if name not in _GITHUB_TOOLS:
+            raise ValueError(
+                f"Неизвестная утилита в tools: {name!r}; доступны: "
+                + ", ".join(EXTRA_TOOLS)
+            )
+    if not cfg.caddy:
+        return []
+    if cfg.caddy_tiles and not cfg.caddy_portal:
+        raise ValueError(
+            "caddy_tiles требует caddy_portal: плитка-прокси живёт на домене "
+            "портала. Либо задайте портал (--caddy-portal ДОМЕН), либо опишите "
+            "сервис отдельным сайтом (--caddy-site ДОМЕН=UPSTREAM)"
+        )
+    tiles = _tiles(cfg)
+    # Генераторы и есть валидация того, что реально уйдёт на хост: домены,
+    # upstream, заголовок портала. Прогоняем их до похода в SSH, чтобы
+    # ошибка в конфиге не стоила ещё одного подключения.
+    if cfg.caddy_email and not _EMAIL_RE.match(cfg.caddy_email):
+        raise ValueError(f"Некорректный caddy_email: {cfg.caddy_email!r}")
+    _caddy_sites_script(cfg, portal=bool(cfg.caddy_portal))
+    if cfg.caddy_portal:
+        _portal_script(cfg, tiles)
+    return tiles
+
+
+def _beszel_key_keep(compose: str, key: str, token: str) -> tuple[str, str]:
+    """(чтение, подстановка) — чтобы не затереть ключ агента на хосте.
+
+    Повторный прогон install-vps без beszel_agent_key/token переписал бы
+    compose пустыми KEY/TOKEN и тихо отвалил бы уже работающий мониторинг.
+    Поэтому в compose попадает маркер, который bash заменяет на прежнее
+    значение из существующего файла (если оно там есть).
+    """
+    if key and token:
+        return "", ""
+    reads: list[str] = []
+    fixes: list[str] = []
+    for value, name in ((key, "KEY"), (token, "TOKEN")):
+        if value:
+            continue
+        marker = f"__BESZEL_{name}_KEEP__"
+        var = f"BESZEL_OLD_{name}"
+        reads.append(
+            f'{var}="$(sed -n \'s/^ *{name}: "\\(.*\\)"$/\\1/p\' {compose} | head -1)"\n'
+        )
+        fixes.append(
+            f'if [ -n "${var}" ]; then\n'
+            f'  $SUDO sed -i "s|{marker}|${{{var}}}|" {compose}\n'
+            f'  echo "  {name.lower()} агента: оставлен прежний (в конфиге не задан)"\n'
+            f"else\n"
+            f'  $SUDO sed -i "s|{marker}||" {compose}\n'
+            f"fi\n"
+        )
+    return "".join(reads), "".join(fixes)
+
+
+def _beszel_script(cfg: Config) -> str:
+    """Фрагмент установки Beszel Hub+Agent: compose, проверка, валидация ключей."""
+    for label, value in (
+        ("beszel_agent_key", cfg.beszel_agent_key),
+        ("beszel_agent_token", cfg.beszel_agent_token),
+    ):
+        if any(ch in value for ch in '"\n\r'):
+            raise ValueError(
+                f"{label} содержит недопустимые символы "
+                '(кавычки или перевод строки); скопируйте значение целиком'
+            )
+    if cfg.beszel_disable_password_auth and not cfg.beszel_user_creation:
+        raise ValueError(
+            "beszel_disable_password_auth требует beszel_user_creation: "
+            "иначе новые пользователи не смогут войти через OAuth и вы "
+            "потеряете доступ к Hub. Сначала настройте OAuth в веб-UI, "
+            "затем включайте оба флага вместе"
+        )
+    public_url = _beszel_public_url(cfg)
+    key_read, key_fix = _beszel_key_keep(
+        BESZEL_COMPOSE, cfg.beszel_agent_key, cfg.beszel_agent_token
+    )
+    return BESZEL_STACK.format(
+        port=cfg.beszel_port,
+        dir=BESZEL_DIR,
+        compose=BESZEL_COMPOSE,
+        key_read=key_read,
+        key_fix=key_fix,
+        app_url=_yaml_str(public_url),
+        public_url=public_url,
+        auth_env=_beszel_auth_env(cfg),
+        auth_warning=_beszel_auth_warning(cfg),
+        key=cfg.beszel_agent_key or "__BESZEL_KEY_KEEP__",
+        key_quoted=_sh_quote(cfg.beszel_agent_key),
+        token=cfg.beszel_agent_token or "__BESZEL_TOKEN_KEEP__",
+        token_quoted=_sh_quote(cfg.beszel_agent_token),
+    ) + BESZEL_VERIFY
+
+
 def install(cfg: Config, host: RemoteHost) -> None:
     """Базовая настройка минимального набора софта."""
+    tiles = _validate(cfg)
     codename = _codename(cfg, host)
     script = _bootstrap(cfg.sudo)
     script += APT_UPDATE
@@ -726,7 +1272,10 @@ def install(cfg: Config, host: RemoteHost) -> None:
         ] + _DOCKER_OFFICIAL_PACKAGES
     # иначе ("ubuntu"): docker.io/docker-compose-v2 уже в cfg.packages
     script += PKG_INSTALL.format(packages=" ".join(packages))
-    script += SWAP512
+    if cfg.swap_size_mb > 0:
+        script += SWAP.format(size_mb=cfg.swap_size_mb)
+    if cfg.tools:
+        script += _tools_script(list(cfg.tools))
     script += JOURNALD_LIMIT.format(
         max_use=cfg.journald_max_use,
         keep_free="200M",
@@ -743,60 +1292,39 @@ def install(cfg: Config, host: RemoteHost) -> None:
             max_file=cfg.docker_log_max_file,
         )
     if cfg.beszel:
-        for label, value in (
-            ("beszel_agent_key", cfg.beszel_agent_key),
-            ("beszel_agent_token", cfg.beszel_agent_token),
-        ):
-            if any(ch in value for ch in '"\n\r'):
-                raise ValueError(
-                    f"{label} содержит недопустимые символы "
-                    '(кавычки или перевод строки); скопируйте значение целиком'
-                )
-        if cfg.beszel_disable_password_auth and not cfg.beszel_user_creation:
-            raise ValueError(
-                "beszel_disable_password_auth требует beszel_user_creation: "
-                "иначе новые пользователи не смогут войти через OAuth и вы "
-                "потеряете доступ к Hub. Сначала настройте OAuth в веб-UI, "
-                "затем включайте оба флага вместе"
-            )
-        script += BESZEL_STACK.format(
-            port=cfg.beszel_port,
-            dir=BESZEL_DIR,
-            compose=BESZEL_COMPOSE,
-            app_url=_yaml_str(
-                f"https://{cfg.caddy_domain}"
-                if cfg.caddy and cfg.caddy_domain
-                else f"http://localhost:{cfg.beszel_port}"
-            ),
-            auth_env=_beszel_auth_env(cfg),
-            auth_warning=_beszel_auth_warning(cfg),
-            key=cfg.beszel_agent_key,
-            key_quoted=_sh_quote(cfg.beszel_agent_key),
-            token=cfg.beszel_agent_token,
-            token_quoted=_sh_quote(cfg.beszel_agent_token),
-        )
-        script += BESZEL_VERIFY
+        script += _beszel_script(cfg)
     if cfg.caddy:
-        if cfg.caddy_email and not _EMAIL_RE.match(cfg.caddy_email):
-            raise ValueError(f"Некорректный caddy_email: {cfg.caddy_email!r}")
+        sites = _caddy_sites_script(cfg, portal=bool(cfg.caddy_portal))
+        if cfg.caddy_portal:
+            sites += _portal_script(cfg, tiles)
         script += CADDY.format(
             dir=CADDY_DIR,
             compose=CADDY_COMPOSE,
             sites_dir=CADDY_SITES_DIR,
+            portal_dir=PORTAL_DIR,
             email=cfg.caddy_email,
             caddyfile=_caddy_caddyfile(cfg.caddy_email),
-            sites=_caddy_sites_script(cfg),
+            sites=sites,
         )
         script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
+        if cfg.caddy_portal:
+            script += _portal_verify_script(cfg, tiles)
+    if cfg.tools:
+        script += _tools_verify_script(list(cfg.tools))
     script += VERIFY
     host.run_script(script)
 
 
 def verify(cfg: Config, host: RemoteHost) -> None:
+    tiles = _validate(cfg)
     script = _bootstrap(cfg.sudo)
     if cfg.beszel:
         script += BESZEL_VERIFY
     if cfg.caddy:
         script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
+        if cfg.caddy_portal:
+            script += _portal_verify_script(cfg, tiles)
+    if cfg.tools:
+        script += _tools_verify_script(list(cfg.tools))
     script += VERIFY
     host.run_script(script)

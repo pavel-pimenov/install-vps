@@ -1,48 +1,82 @@
-# Конфиг для install-vps.
+# Конфиг для install-vps (боевой хост dev.fly-server.ru).
 # Ключи CLI перекрывают значения из этого файла.
 
-host = ""                     # IP или DNS имя VPS
-user = "root"                 # пользователь SSH
+host = "dev.fly-server.ru"
+user = "root"
 port = 22
 key_path = "~/.ssh/id_ed25519"
-accept_new = true             # автоматически добавить новый host в known_hosts
+accept_new = true
 
-# Минимальный набор софта (можно переопределить через --packages)
-# packages = ["nload", "htop", "btop", "mc", "git", "docker-compose-v2"]
+packages = ["nload", "htop", "btop", "mc", "git", "procps", "docker.io",
+            "docker-compose-v2", "fail2ban", "ncdu", "logrotate"]
 
-# Мониторинг Beszel (Hub + Agent на одной машине, docker compose, порт 8090)
-# beszel = true
-# beszel_port = 8090
-# Ключ и токен агента выдаёт веб-UI Hub: открыть http://<host>:8090, создать
-# пользователя, Add system -> скопировать оба значения и перезапустить
-# install-vps (повторный запуск идемпотентно добавит/пересоздаст агента).
+# Источник docker: "ubuntu" (docker.io + docker-compose-v2 из архивов Ubuntu)
+# или "official" (docker-ce с download.docker.com).
+docker_source = "ubuntu"
+
+# Файл подкачки в МБ; 0 — не создавать. Уже созданный /swapfile не меняется.
+swap_size_mb = 512
+
+# Утилиты, которых нет в репозиториях Ubuntu: ставятся из релизов GitHub
+# с закреплённой версией и проверкой sha256 в /usr/local/bin.
+# tools = ["lazydocker", "bandwhich"]
+
+# Мониторинг Beszel (Hub + Agent на одной машине, docker compose, порт 8090).
+beszel = true
+beszel_port = 8090
+# Ключ и токен агента намеренно НЕ хранятся здесь: они выдаются веб-UI Hub
+# (Add system) и являются секретом. Если их не передать флагами, install-vps
+# сохранит уже настроенные на хосте значения (иначе повторный прогон тихо
+# сломал бы мониторинг).
 # beszel_agent_key = "ssh-ed25519 AAAA..."
 # beszel_agent_token = "xxxx-xxxx-xxxx-xxxx"
+# Вход через OAuth без пароля (провайдер настраивается в веб-UI Hub):
+# beszel_user_creation = true
+# beszel_disable_password_auth = true   # только вместе с user_creation!
 
-# Сжатый своп zram поверх обычного swapfile. На VPS с 512M-1024M RAM заметно
-# отзывчивее: сначала уходит в zram (приоритет 100), swapfile — вторая ступень.
-# zram_size_mb = 256
+# Сжатый своп zram поверх обычного swapfile: на VPS с 512M-1024M RAM заметно
+# отзывчивее (сначала уходит в zram, приоритет 100, swapfile — вторая ступень).
+zram_size_mb = 256
 
 # Лимит systemd-журнала: /etc/systemd/journald.conf.d/10-size-limit.conf
-# journald_max_use = "100M"
+journald_max_use = "100M"
 
-# Ротация логов контейнеров в /etc/docker/daemon.json (перезаписывает
-# log-driver/log-opts, остальные ключи файла сохраняются)
-# docker_log_max_size = "10m"
-# docker_log_max_file = "3"
+# Ротация логов контейнеров в /etc/docker/daemon.json
+docker_log_max_size = "10m"
+docker_log_max_file = "3"
 
-# Caddy — обратный прокси с автоматическим HTTPS (Let's Encrypt). Занимает
-# 80/443 на хосте (network_mode: host) и проксирует на локальные порты.
-# Перед включением создайте A-записи доменов на хост:
-#   monitor.example.com  A  <ip-хоста>
-#   thin.example.com     A  <ip-хоста>
-# caddy = true
-# caddy_email = "you@example.com"      # для уведомлений об истечении сертификата
-# caddy_domain = "monitor.example.com" # домен для Beszel Hub
-# Любые другие сайты — по одному на строку, "домен=upstream":
-# caddy_sites = [
-#     "thin.example.com=http://127.0.0.1:8080",
-# ]
-# Сайты пишутся отдельными файлами в /opt/caddy/sites/*.caddy и подключаются
-# через import — новый сайт добавляется одним файлом, без правки Caddyfile.
+# --- Caddy: автоматический HTTPS (Let's Encrypt) -----------------------------
+# Caddy занимает 80/443 на хосте (network_mode: host) и проксирует на локальные
+# порты. A-записи доменов уже указывают на хост.
+caddy = true
+caddy_email = "pavel.pimenov@gmail.com"
+
+# Портал: https://dev.fly-server.ru/ — страница с плитками сервисов.
+caddy_portal = "dev.fly-server.ru"
+caddy_portal_title = "Сервисы"
+# Плитки бывают двух видов:
+#   "Название=https://домен"         — внешняя ссылка;
+#   "Название=/путь=upstream"        — Caddy проксирует путь на локальный сервис
+#     и срезает префикс (приложение видит "/"); четвёртое поле keep оставляет
+#     префикс — для приложений, которые сами знают свой базовый путь.
+# Проксирование под путём подходит НЕ всем приложениям: Beszel и ThinPro отдают
+# /assets/... и /api/... от корня, поэтому под префиксом их вёрстка ломается —
+# для них плитки ведут на собственные домены.
+caddy_tiles = [
+    "Мониторинг=https://monitor.fly-server.ru",
+    "ThinPro=https://thinpro.fly-server.ru",
+]
+
+# Домен самого Beszel Hub. Пока он задан, автоплитка мониторинга на портале не
+# добавляется — выше она описана ссылкой вручную.
+caddy_domain = "monitor.fly-server.ru"
+beszel_path = "/monitor"
+
+# Сайты, которые Caddy отдаёт целиком: "домен=upstream".
+# Каждый сайт — отдельный файл /opt/caddy/sites/*.caddy, корневой Caddyfile
+# только импортирует их, так что новый сайт = одна строка здесь.
+caddy_sites = [
+    "thinpro.fly-server.ru=127.0.0.1:8080",
+]
+# Страница портала: /opt/caddy/portal/index.html (генерируется из caddy_tiles).
 # Перечитать конфиг: docker exec caddy caddy reload --config /etc/caddy/Caddyfile
