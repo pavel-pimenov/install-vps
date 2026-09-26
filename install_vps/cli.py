@@ -52,6 +52,19 @@ def _parser() -> argparse.ArgumentParser:
                         "(включайте лишь после проверки, что OAuth работает — иначе логин потерян)")
     p.add_argument("--beszel-path", metavar="PATH",
                    help="путь плитки Beszel на портале (по умолчанию /monitor)")
+    p.add_argument("--dozzle", action="store_true",
+                   help="логи контейнеров в браузере (Dozzle) под путём портала, "
+                        "с входом по паролю; требует --caddy-portal")
+    p.add_argument("--dozzle-port", type=int,
+                   help="локальный порт Dozzle, слушает только 127.0.0.1 "
+                        "(по умолчанию 8082)")
+    p.add_argument("--dozzle-path", metavar="PATH",
+                   help="путь плитки логов на портале (по умолчанию /logs)")
+    p.add_argument("--dozzle-user", metavar="NAME",
+                   help="логин Dozzle (по умолчанию admin)")
+    p.add_argument("--dozzle-password", metavar="PASSWORD",
+                   help="пароль Dozzle; не задан — сгенерируется на хосте и "
+                        "покажется один раз, users.yml больше не перезаписывается")
     p.add_argument("--zram-size-mb", type=int,
                    help="размер zram-свопа в МБ, 0 — не трогать (по умолчанию 0)")
     p.add_argument("--journald-max-use", metavar="SIZE",

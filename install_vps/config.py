@@ -51,6 +51,12 @@ class Config:
     caddy_tiles: list[str] = field(default_factory=list)
     # "Название=/путь=upstream" (префикс срезается) либо "Название=https://домен"
     beszel_path: str = "/monitor"   # путь плитки Beszel на портале
+    # Dozzle: логи контейнеров в браузере, живёт под базовым путём портала
+    dozzle: bool = False
+    dozzle_port: int = 8082        # слушает только 127.0.0.1, наружу отдаёт Caddy
+    dozzle_path: str = "/logs"
+    dozzle_user: str = "admin"
+    dozzle_password: str = ""      # "" — сгенерировать на хосте и показать один раз
 
 
 def load_config(path: Path | None) -> Config:
@@ -81,6 +87,11 @@ _OVERRIDES = (
     ("beszel_user_creation", "beszel_user_creation"),
     ("beszel_disable_password_auth", "beszel_disable_password_auth"),
     ("beszel_path", "beszel_path"),
+    ("dozzle", "dozzle"),
+    ("dozzle_port", "dozzle_port"),
+    ("dozzle_path", "dozzle_path"),
+    ("dozzle_user", "dozzle_user"),
+    ("dozzle_password", "dozzle_password"),
     ("zram_size_mb", "zram_size_mb"),
     ("journald_max_use", "journald_max_use"),
     ("docker_log_max_size", "docker_log_max_size"),

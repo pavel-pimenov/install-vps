@@ -104,6 +104,12 @@ _HOSTNAME_RE = re.compile(
 _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# диапазон непривилегированных портов: всё, что ниже 1024, требует Capabilities
+_PORT_MIN = 1024
+_PORT_MAX = 65535
+
+_FIRST_PRINTABLE = 32  # ниже — управляющие символы, в bash-схеме они лишние
+
 
 def _tool_script(name: str) -> str:
     """bash-фрагмент установки утилиты из GitHub-релиза.
@@ -341,6 +347,8 @@ class Tile:
     upstream: str = ""     # что проксировать на этот путь
     keep_prefix: bool = False  # True — не срезать префикс (приложение знает базу)
     beszel: bool = False
+    streaming: bool = False    # True — поток (SSE): без flush_interval -1 логи
+    #                            приходят пачками или не приходят вовсе
 
 
 def _external_url(raw: str) -> str:
@@ -380,7 +388,9 @@ def _parse_tile(raw: str, portal: str) -> Tile:
             f"а получено {raw!r}"
         )
     name = parts[0]
-    if any(ch in name for ch in "\n\r") or "<" in name or ">" in name:
+    # название попадает и в HTML, и в строки проверочного bash — кавычки,
+    # доллары и обратные слэши там ломали бы скрипт или выполнили подстановку
+    if any(ch in name for ch in "\n\r<>'\"$`\\") or any(ord(ch) < _FIRST_PRINTABLE for ch in name):
         raise ValueError(f"Недопустимое название плитки: {name!r}")
     if len(parts) == _TILE_FIELDS_EXTERNAL:
         href = _external_url(parts[1])
@@ -419,6 +429,10 @@ def _beszel_path(cfg: Config) -> str:
     return "/" + cfg.beszel_path.strip("/")
 
 
+def _dozzle_path(cfg: Config) -> str:
+    return "/" + cfg.dozzle_path.strip("/")
+
+
 def _beszel_public_url(cfg: Config) -> str:
     """Публичный адрес Beszel Hub: APP_URL и подсказки в выводе."""
     if cfg.caddy and cfg.caddy_domain:
@@ -429,11 +443,13 @@ def _beszel_public_url(cfg: Config) -> str:
 
 
 def _tiles(cfg: Config) -> list[Tile]:
-    """Плитки портала: из конфига + автоплитка мониторинга.
+    """Плитки портала: из конфига + автоплитки мониторинга и логов.
 
     Плитка Beszel появляется сама, когда Caddy включён, домен портала задан, а
     для Beszel не выделен отдельный домен (caddy_domain) — иначе он жил бы
     вне портала, и ссылаться на него нужно было бы отдельной строкой.
+    Плитка Dozzle добавляется по той же причине: путь и upstream известны из
+    конфига, а прокси для неё особенный (keep + flush_interval).
     """
     tiles = [_parse_tile(raw, cfg.caddy_portal) for raw in cfg.caddy_tiles]
     if cfg.beszel and cfg.caddy and cfg.caddy_portal and not cfg.caddy_domain:
@@ -447,6 +463,22 @@ def _tiles(cfg: Config) -> list[Tile]:
                 path=path,
                 upstream=f"127.0.0.1:{cfg.beszel_port}",
                 beszel=True,
+            ),
+        )
+    if cfg.dozzle and cfg.caddy and cfg.caddy_portal:
+        path = _dozzle_path(cfg)
+        tiles.insert(
+            0 if not tiles else 1,
+            Tile(
+                name="Логи",
+                href=f"https://{cfg.caddy_portal}{path}/",
+                hint=f"{cfg.caddy_portal}{path}",
+                path=path,
+                upstream=f"127.0.0.1:{cfg.dozzle_port}",
+                # dozzle живёт под базовым путём (DOZZLE_BASE): префикс
+                # обязателен, иначе вёрстка и ассеты не найдутся
+                keep_prefix=True,
+                streaming=True,
             ),
         )
     paths = [tile.path for tile in tiles if tile.path]
@@ -494,6 +526,17 @@ def _portal_caddy_block(cfg: Config, tiles: list[Tile]) -> str:
                 f"\t\treverse_proxy {tile.upstream} {{",
                 "\t\t\ttransport http {",
                 "\t\t\t\tread_timeout 360s",
+                "\t\t\t}",
+                "\t\t}",
+            ]
+        elif tile.streaming:
+            # dozzle.dev/guide/changing-base: SSE требует отключённой
+            # буферизации и больших таймаутов, иначе логи замирают
+            lines += [
+                f"\t\treverse_proxy {tile.upstream} {{",
+                "\t\t\tflush_interval -1",
+                "\t\t\ttransport http {",
+                "\t\t\t\tread_timeout 3600s",
                 "\t\t\t}",
                 "\t\t}",
             ]
@@ -603,8 +646,10 @@ def _portal_verify_script(cfg: Config, tiles: list[Tile]) -> str:
             f'CODE="{probe(target)}"',
             '[ -n "$CODE" ] || CODE=000',
             'case "$CODE" in',
-            "  2??|3??) echo '  OK: плитка " + tile.name + " -> " + tile.path
-            + "/ ($CODE)' ;;",
+            # кавычки двойные, иначе $CODE не подставится (в одинарных он
+            # остаётся литералом) — название плитки уже проверено в _parse_tile
+            "  2??|3??) echo \"  OK: плитка " + tile.name + " -> " + tile.path
+            + "/ (код $CODE)\" ;;",
             "  000|502|503|504) echo \"  WARN: " + tile.name + " не отвечает ("
             + tile.upstream + ", код $CODE)\" ;;",
             "  *) echo \"  WARN: " + tile.name + " ответил кодом $CODE\" ;;",
@@ -739,6 +784,16 @@ echo "  осталось ядер: $($SUDO dpkg -l 'linux-image-*' 2>/dev/null |
 
 BESZEL_DIR = "/opt/beszel"
 BESZEL_COMPOSE = "/opt/beszel/docker-compose.yml"
+
+# Dozzle: веб-морда над логами контейнеров. Живёт под базовым путём портала
+# (DOZZLE_BASE) и слушает только 127.0.0.1: наружу его отдаёт Caddy.
+# Версия закреплена: `latest` у dozzle означает majors, а логи сервера —
+# чувствительное место, где молчаливый апгрейд особенно нежелателен.
+DOZZLE_VERSION = "v11.1.1"
+DOZZLE_DIR = "/opt/dozzle"
+DOZZLE_COMPOSE = "/opt/dozzle/docker-compose.yml"
+DOZZLE_USERS = "/opt/dozzle/users.yml"
+DOZZLE_DATA = "/opt/dozzle/data"
 
 # Caddy: постоянные пути. Сайты лежат отдельными файлами в sites/ и
 # подключаются через import — новый сайт добавляется одним файлом.
@@ -1121,6 +1176,60 @@ else
 fi
 """
 
+DOZZLE_STACK = r"""
+echo "==> Dozzle {version}: логи контейнеров (127.0.0.1:{port}, путь {base})"
+$SUDO install -m 0755 -d {dir} {data_dir}
+{users_block}cat <<'DOZZLE_EOF' | $SUDO tee {compose} >/dev/null
+services:
+  dozzle:
+    image: {image}
+    container_name: dozzle
+    restart: unless-stopped
+    # только localhost: наружу отдаёт Caddy, иначе логи были бы доступны
+    # всем, кто угадает порт, в обход авторизации
+    ports:
+      - "127.0.0.1:{port}:8080"
+    environment:
+      DOZZLE_BASE: {base}
+      DOZZLE_AUTH_PROVIDER: simple
+      DOZZLE_ENABLE_ACTIONS: "false"
+      DOZZLE_ENABLE_SHELL: "false"
+      DOZZLE_DISABLE_AVATARS: "true"
+      DOZZLE_NO_ANALYTICS: "true"
+      DOZZLE_LEVEL: info
+      DOZZLE_TIMEOUT: 30s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./users.yml:/data/users.yml:ro
+      - ./data:/data
+DOZZLE_EOF
+$SUDO docker compose -f {compose} up -d --remove-orphans
+$SUDO docker compose -f {compose} ps
+for _ in $(seq 1 30); do
+  if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx dozzle; then break; fi
+  sleep 2
+done
+"""
+
+DOZZLE_VERIFY = r"""
+# docker ps --format принимает шаблон Go: после format() quadruple-скобки
+# становятся {{.Names}}, иначе docker получает битый шаблон и молчит
+if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx dozzle; then
+  echo "  OK: dozzle -> $($SUDO docker ps --filter name=^/dozzle$ --format '{{{{.Status}}}}')"
+else
+  echo "  MISSING: dozzle"
+fi
+CODE="$($SUDO curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}{base}/ 2>/dev/null || true)"
+[ -n "$CODE" ] || CODE=000
+case "$CODE" in
+  200|302|303|307) echo "  OK: dozzle отвечает на 127.0.0.1:{port}{base}/ (код $CODE — редирект" \
+      "на форму входа, авторизация включена)" ;;
+  401) echo "  OK: dozzle отвечает и требует входа (401)" ;;
+  000) echo "  MISSING: dozzle не отвечает на 127.0.0.1:{port}{base}/" ;;
+  *) echo "  WARN: dozzle ответил кодом $CODE" ;;
+esac
+"""
+
 
 def _codename(cfg: Config, host: RemoteHost) -> str:
     """Определяет VERSION_CODENAME на удалённом хосте через /etc/os-release."""
@@ -1151,6 +1260,16 @@ def _validate(cfg: Config) -> list[Tile]:
         path = _beszel_path(cfg)
         if not _PORTAL_PATH_RE.match(path):
             raise ValueError(f"Некорректный beszel_path: {cfg.beszel_path!r}")
+    if cfg.dozzle and not cfg.caddy_portal:
+        raise ValueError(
+            "dozzle требует caddy_portal: Dozzle живёт под базовым путём "
+            "портала (DOZZLE_BASE), отдельный домен ему не нужен. Задайте "
+            "портал (--caddy-portal ДОМЕН) вместе с --dozzle"
+        )
+    if cfg.dozzle and cfg.caddy_portal:
+        path = _dozzle_path(cfg)
+        if not _PORTAL_PATH_RE.match(path):
+            raise ValueError(f"Некорректный dozzle_path: {cfg.dozzle_path!r}")
     if cfg.caddy_portal and not _HOSTNAME_RE.match(cfg.caddy_portal):
         raise ValueError(f"Некорректный домен портала: {cfg.caddy_portal!r}")
     for name in cfg.tools:
@@ -1208,6 +1327,84 @@ def _beszel_key_keep(compose: str, key: str, token: str) -> tuple[str, str]:
             f"fi\n"
         )
     return "".join(reads), "".join(fixes)
+
+
+def _dozzle_users_block(cfg: Config, image: str) -> str:
+    """Создание users.yml: пароль из конфига либо сгенерированный на хосте.
+
+    users.yml хранит bcrypt-хеш, поэтому восстановить из него пароль нельзя.
+    Если пароль не задан в конфиге, файл создаётся один раз и дальше не
+    трогается: иначе повторный прогон тихо сбрасывал бы пароль, который
+    пользователь уже запомнил. Задать свой — dozzle_password в конфиге.
+    Пароль передаётся в контейнер через stdin, а не --password, чтобы не
+    светился в ps хоста.
+    """
+    create = (
+        "  if ! echo \"$DOZZLE_PASS\" | $SUDO docker run --rm -i {image} generate "
+        '{user} > "$TMP_USERS"; then\n'
+        '    echo "  ОШИБКА: не удалось создать users.yml" >&2\n'
+        '    rm -f "$TMP_USERS"; exit 1\n'
+        "  fi\n"
+        '  if [ ! -s "$TMP_USERS" ]; then\n'
+        '    echo "  ОШИБКА: users.yml пустой" >&2\n'
+        '    rm -f "$TMP_USERS"; exit 1\n'
+        "  fi\n"
+        '  $SUDO install -m 0600 "$TMP_USERS" {users}\n'
+        '  rm -f "$TMP_USERS"\n'
+    ).format(image=image, user=_sh_quote(cfg.dozzle_user), users=DOZZLE_USERS)
+    if cfg.dozzle_password:
+        return (
+            'TMP_USERS="$(mktemp)"\n'
+            f"DOZZLE_PASS={_sh_quote(cfg.dozzle_password)}\n"
+            + create
+            + f'  echo "  логин: {cfg.dozzle_user} (пароль из конфига)"\n'
+        )
+    return (
+        f"if [ -s {DOZZLE_USERS} ]; then\n"
+        '  echo "  users.yml уже есть — пароль прежний, не трогаю"\n'
+        "else\n"
+        '  TMP_USERS="$(mktemp)"\n'
+        "  DOZZLE_PASS=\"$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-16)\"\n"
+        '  if [ -z "$DOZZLE_PASS" ]; then\n'
+        '    echo "  ОШИБКА: не удалось сгенерировать пароль" >&2; exit 1\n'
+        "  fi\n"
+        + create
+        + f'  echo "  логин: {cfg.dozzle_user}"\n'
+        '  echo "  пароль (сохраните, показывается один раз): $DOZZLE_PASS"\n'
+        "fi\n"
+    )
+
+
+def _dozzle_script(cfg: Config) -> str:
+    """Фрагмент установки Dozzle: users.yml, compose, запуск."""
+    if not _PORT_MIN <= cfg.dozzle_port <= _PORT_MAX:
+        raise ValueError(f"Некорректный dozzle_port: {cfg.dozzle_port!r}")
+    if any(ch in cfg.dozzle_user for ch in "/\\\n\r\"' $"):
+        raise ValueError(
+            f"Недопустимое имя пользователя dozzle: {cfg.dozzle_user!r}"
+        )
+    if any(ch in cfg.dozzle_password for ch in "\n\r\"'"):
+        raise ValueError(
+            "dozzle_password не должен содержать кавычки или перевод строки"
+        )
+    image = f"amir20/dozzle:{DOZZLE_VERSION}"
+    base = _dozzle_path(cfg)
+    return DOZZLE_STACK.format(
+        version=DOZZLE_VERSION,
+        dir=DOZZLE_DIR,
+        data_dir=DOZZLE_DATA,
+        compose=DOZZLE_COMPOSE,
+        users=DOZZLE_USERS,
+        image=image,
+        port=cfg.dozzle_port,
+        base=_yaml_str(base),
+        users_block=_dozzle_users_block(cfg, image),
+    )
+
+
+def _dozzle_verify_script(cfg: Config) -> str:
+    """Проверка Dozzle (работает и в --verify-only)."""
+    return DOZZLE_VERIFY.format(port=cfg.dozzle_port, base=_dozzle_path(cfg))
 
 
 def _beszel_script(cfg: Config) -> str:
@@ -1293,6 +1490,8 @@ def install(cfg: Config, host: RemoteHost) -> None:
         )
     if cfg.beszel:
         script += _beszel_script(cfg)
+    if cfg.dozzle:
+        script += _dozzle_script(cfg)
     if cfg.caddy:
         sites = _caddy_sites_script(cfg, portal=bool(cfg.caddy_portal))
         if cfg.caddy_portal:
@@ -1320,6 +1519,8 @@ def verify(cfg: Config, host: RemoteHost) -> None:
     script = _bootstrap(cfg.sudo)
     if cfg.beszel:
         script += BESZEL_VERIFY
+    if cfg.dozzle:
+        script += _dozzle_verify_script(cfg)
     if cfg.caddy:
         script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
         if cfg.caddy_portal:
