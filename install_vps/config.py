@@ -48,6 +48,11 @@ class Config:
     caddy_sites: list[str] = field(default_factory=list)  # "домен=http://upstream"
     caddy_portal: str = ""         # домен страницы с плитками сервисов
     caddy_portal_title: str = "Сервисы"  # заголовок страницы плиток
+    # единый вход на портал (HTTP basic): браузер спрашивает логин/пароль один
+    # раз, дальше все плитки открываются без форм (свою авторизацию Dozzle
+    # при этом выключаем — её заменяет пароль портала)
+    portal_user: str = "admin"
+    portal_password: str = ""      # "" — портал без пароля (каждый сервис со своим)
     caddy_tiles: list[str] = field(default_factory=list)
     # "Название=/путь=upstream" (префикс срезается) либо "Название=https://домен"
     beszel_path: str = "/monitor"   # путь плитки Beszel на портале
@@ -102,6 +107,8 @@ _OVERRIDES = (
     ("caddy_sites", "caddy_site"),
     ("caddy_portal", "caddy_portal"),
     ("caddy_portal_title", "caddy_portal_title"),
+    ("portal_user", "portal_user"),
+    ("portal_password", "portal_password"),
     ("caddy_tiles", "caddy_tile"),
 )
 

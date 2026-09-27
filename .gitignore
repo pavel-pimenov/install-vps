@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Локальные секреты: этот файл НЕ коммитится (см. .gitignore).
+# Копия config.toml с паролем портала и ключами агента.
+config.local.toml

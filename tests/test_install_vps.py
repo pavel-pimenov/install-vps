@@ -285,6 +285,18 @@ class DozzleTests(unittest.TestCase):
         self.assertIn('DOZZLE_ENABLE_ACTIONS: "false"', script)
         self.assertIn('DOZZLE_ENABLE_SHELL: "false"', script)
 
+    def test_password_change_recreates_container(self) -> None:
+        # регрессия (найдено на боевом хосте): Dozzle держит users.yml в памяти,
+        # поэтому после смены пароля вход оставался 401, пока контейнер
+        # не пересоздали. Пересоздание — только когда users.yml перезаписан.
+        script = installer._dozzle_script(self._cfg(dozzle_password="s3cret-pass"))
+        self.assertIn("DOZZLE_USERS_NEW=1", script)
+        self.assertIn("--force-recreate", script)
+        # ...и при обычном прогоне контейнер не трогаем
+        keep = installer._dozzle_script(self._cfg())
+        self.assertIn("DOZZLE_USERS_NEW=''", keep)
+        self.assertIn("пароль прежний, не трогаю", keep)
+
     def test_verify_script(self) -> None:
         script = installer._dozzle_verify_script(self._cfg())
         self.assertIn("http://127.0.0.1:8082/logs/", script)
@@ -335,6 +347,29 @@ class PortalOutputTests(unittest.TestCase):
         self.assertIn("\thandle /a/* {", block)
         self.assertNotIn("handle_path /a", block)
 
+    def test_portal_probe_waits_for_certificate(self) -> None:
+        # регрессия (найдено на первом прогоне): Caddy после reload ещё
+        # выпускает сертификат, TLS не проходит и портал ложно MISSING
+        cfg = full_config()
+        script = installer._portal_verify_script(cfg, _tiles(cfg))
+        self.assertIn("for _ in $(seq 1 45); do", script)
+        self.assertIn('sleep 2', script)
+        # ожидание должно быть до проверки, иначе оно бессмысленно
+        self.assertLess(
+            script.index("seq 1 45"), script.index("OK: страница плиток отдаётся")
+        )
+
+    def test_restarting_agent_is_not_ok(self) -> None:
+        # регрессия: docker ps показывает и перезапускающиеся контейнеры,
+        # агент без ключа падал в цикл, а проверка рапортовала OK
+        cfg = full_config()
+        host = FakeHost()
+        verify(cfg, host)  # type: ignore[arg-type]
+        script = host.script
+        self.assertIn("Restarting*)", script)
+        self.assertIn("ПРОБЛЕМА: beszel-agent", script)
+        self.assertIn("--beszel-key", script)
+
     def test_html_escapes_names(self) -> None:
         # кавычки в названии теперь отвергаются _parse_tile (они ломали бы
         # проверочный bash), но & остаётся допустимым — HTML его экранирует
@@ -349,6 +384,105 @@ class PortalOutputTests(unittest.TestCase):
         html = _portal_html(cfg, _tiles(cfg))
         for needle in ("http://", "cdn", "<script"):
             self.assertNotIn(needle, html, f"в странице портала есть {needle!r}")
+
+
+class PortalAuthTests(unittest.TestCase):
+    """Единый вход на портал: пароль спрашивается один раз."""
+
+    password = "test-portal-pass-42"
+
+    def _cfg(self, **overrides) -> Config:
+        values = {"portal_user": "admin", "portal_password": self.password}
+        values.update(overrides)
+        return full_config(dozzle=True, **values)
+
+    def test_basic_auth_with_hash_placeholder(self) -> None:
+        cfg = self._cfg()
+        block = _portal_caddy_block(cfg, _tiles(cfg))
+        self.assertIn("\tbasic_auth {", block)
+        self.assertIn("\t\tadmin __PORTAL_HASH__", block)
+        # пароль в Caddyfile оставаться не должен: на диск уходит только хеш
+        self.assertNotIn(self.password, block)
+
+    def test_hash_counted_on_host_without_argv(self) -> None:
+        cfg = self._cfg()
+        script = installer._portal_script(cfg, _tiles(cfg))
+        self.assertIn("caddy hash-password", script)
+        # stdin, а не --plaintext: открытый пароль не должен светиться в ps
+        self.assertNotIn("--plaintext", script)
+        self.assertIn("printf '%s\\n' 'test-portal-pass-42'", script)
+        self.assertIn('s|__PORTAL_HASH__|$PORTAL_HASH|', script)
+        self.assertIn("/opt/caddy/sites/portal.caddy", script)
+
+    def test_no_auth_without_password(self) -> None:
+        cfg = full_config(dozzle=True)
+        self.assertNotIn("basic_auth", _portal_caddy_block(cfg, _tiles(cfg)))
+        self.assertNotIn("hash-password", installer._portal_script(cfg, _tiles(cfg)))
+
+    def test_dozzle_own_auth_disabled(self) -> None:
+        script = installer._dozzle_script(self._cfg())
+        self.assertNotIn("DOZZLE_AUTH_PROVIDER", script)
+        self.assertNotIn("users.yml:/data/users.yml", script)
+        self.assertIn("свой вход Dozzle выключен", script)
+
+    def test_dozzle_own_auth_kept_without_portal_password(self) -> None:
+        script = installer._dozzle_script(full_config(dozzle=True))
+        self.assertIn("DOZZLE_AUTH_PROVIDER: simple", script)
+        self.assertIn("- ./users.yml:/data/users.yml:ro", script)
+
+    def test_verify_probes_with_credentials(self) -> None:
+        cfg = self._cfg()
+        verify_script = installer._portal_verify_script(cfg, _tiles(cfg))
+        # иначе каждая плитка отвечала бы 401 и проверка врала бы
+        self.assertIn("-u 'admin:test-portal-pass-42'", verify_script)
+        self.assertIn("401) echo '  OK: без пароля портал не отдаётся (401)'", verify_script)
+        # анонимная проба обязана идти без credentials, иначе 401 не проверить
+        anon = verify_script.split("ANON=")[1].split("\n")[0]
+        self.assertNotIn(" -u ", anon)
+
+    def test_verify_without_password_has_no_credentials(self) -> None:
+        cfg = full_config()
+        self.assertNotIn("curl -u", installer._portal_verify_script(cfg, _tiles(cfg)))
+
+    def test_dozzle_verify_reports_who_asks_password(self) -> None:
+        self.assertIn(
+            "вход: пароль портала", installer._dozzle_verify_script(self._cfg())
+        )
+        self.assertIn(
+            "вход: собственная форма",
+            installer._dozzle_verify_script(full_config(dozzle=True)),
+        )
+
+    def test_password_requires_portal(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._validate(
+                full_config(portal_password="x", caddy_portal="", caddy_tiles=[])
+            )
+
+    def test_password_rejects_shell_and_curl_metacharacters(self) -> None:
+        for bad in ('a"b', "a'b", "a:b", "a\nb", "a b\rc"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                installer._validate(self._cfg(portal_password=bad))
+
+    def test_empty_user_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._validate(self._cfg(portal_user="  "))
+
+    def test_dozzle_on_separate_site_rejected(self) -> None:
+        # пароль портала не действует на домене из caddy_sites, а свой вход
+        # Dozzle при portal_password выключен — логи были бы без входа
+        with self.assertRaises(ValueError):
+            installer._validate(
+                self._cfg(caddy_sites=["logs.example.com=http://127.0.0.1:8082"])
+            )
+
+    def test_cli_flags(self) -> None:
+        args = _parser().parse_args(
+            ["--portal-user", "operator", "--portal-password", "test-portal-pass-42"]
+        )
+        cfg = apply_overrides(Config(), args)
+        self.assertEqual(cfg.portal_user, "operator")
+        self.assertEqual(cfg.portal_password, "test-portal-pass-42")
 
 
 class BeszelUrlTests(unittest.TestCase):
@@ -417,6 +551,16 @@ class GeneratedScriptTests(unittest.TestCase):
     def test_minimal_script_is_valid_bash(self) -> None:
         bash_check(self._install_script(Config(host="203.0.113.5")))
 
+    def test_portal_auth_script_is_valid_bash(self) -> None:
+        cfg = full_config(dozzle=True, portal_password="test-portal-pass-42")
+        script = self._install_script(cfg)
+        bash_check(script)
+        # заглушка обязана подменяться уже после записи файла сайта
+        self.assertLess(script.index("CADDY_SITE_EOF"), script.index("__PORTAL_HASH__|$"))
+        host = FakeHost()
+        verify(cfg, host)  # type: ignore[arg-type]
+        bash_check(host.script)
+
     def test_official_docker_source(self) -> None:
         cfg = full_config(docker_source="official")
         script = self._install_script(cfg)
@@ -474,6 +618,29 @@ class GeneratedScriptTests(unittest.TestCase):
             script.index(f"tee {installer.BESZEL_COMPOSE}"),
         )
         bash_check(script)
+
+    def test_beszel_key_read_survives_missing_compose(self) -> None:
+        # регрессия (найдено на чистом Ubuntu 26.04): compose на пустом хосте
+        # ещё нет, sed по нему падает с кодом 2, а pipefail + set -e роняют
+        # всю установку. Чтение обязано быть под [ -f ]
+        script = self._install_script(
+            full_config(beszel_agent_key="", beszel_agent_token="")
+        )
+        self.assertIn(f"if [ -f {installer.BESZEL_COMPOSE} ]; then", script)
+        # ...и это чтение обязано реально переживать отсутствие файла
+        read = next(
+            block
+            for block in script.split("if [ -f ")
+            if block.startswith(installer.BESZEL_COMPOSE)
+        )
+        out = subprocess.run(
+            ["bash", "-c", f'set -euo pipefail\nif [ -f {read}'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("No such file", out.stderr)
 
     def test_beszel_key_in_config_written_as_is(self) -> None:
         script = self._install_script(full_config())

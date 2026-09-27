@@ -87,6 +87,12 @@ def _parser() -> argparse.ArgumentParser:
                         "плитки ведут на сервисы этого сервера")
     p.add_argument("--caddy-portal-title", metavar="TITLE",
                    help="заголовок страницы плиток (по умолчанию «Сервисы»)")
+    p.add_argument("--portal-user", metavar="USER",
+                   help="логин для входа на портал (по умолчанию «admin»)")
+    p.add_argument("--portal-password", metavar="PASSWORD",
+                   help="пароль входа на портал: спрашивается один раз, "
+                        "внутренние сервисы со своими формами не мешают "
+                        "(Dozzle перестаёт спрашивать отдельно)")
     p.add_argument("--caddy-tile", metavar="TILE", action="append",
                    help="плитка портала: Мониторинг=/monitor=127.0.0.1:8090 "
                         "(префикс срезается), или Мониторинг=https://домен "

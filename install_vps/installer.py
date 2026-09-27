@@ -97,6 +97,13 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def _caddy_token(value: str) -> str:
+    """Токен Caddyfile: в кавычках, если в значении есть спецсимволы."""
+    if value and not any(ch.isspace() or ch in "\"{}#" for ch in value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 _HOSTNAME_RE = re.compile(
     r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
     r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
@@ -109,6 +116,8 @@ _PORT_MIN = 1024
 _PORT_MAX = 65535
 
 _FIRST_PRINTABLE = 32  # ниже — управляющие символы, в bash-схеме они лишние
+
+_ACME_WAIT_SEC = 90  # сколько ждём сертификат Caddy перед проверкой портала
 
 
 def _tool_script(name: str) -> str:
@@ -507,6 +516,15 @@ def _portal_caddy_block(cfg: Config, tiles: list[Tile]) -> str:
         "\t\tmax_size 10MB",
         "\t}",
     ]
+    if cfg.portal_password:
+        # единый вход на портал: basic_auth — pre-handler, поэтому проверка
+        # пароля идёт до всех handle-блоков, и одна авторизация закрывает
+        # и страницу плиток, и всё, что за ней проксируется
+        lines += [
+            "\tbasic_auth {",
+            f"\t\t{_caddy_token(cfg.portal_user)} __PORTAL_HASH__",
+            "\t}",
+        ]
     for tile in tiles:
         if not tile.path:
             continue
@@ -599,12 +617,38 @@ def _portal_script(cfg: Config, tiles: list[Tile]) -> str:
         )
     return (
         _write_site_script("portal", _portal_caddy_block(cfg, tiles))
+        + _portal_hash_script(cfg)
         + f"echo \"==> портал {cfg.caddy_portal}: страница плиток\"\n"
         + f"$SUDO install -m 0755 -d {PORTAL_DIR}\n"
         + f"cat <<'PORTAL_EOF' | $SUDO tee {PORTAL_INDEX} >/dev/null\n"
         + _portal_html(cfg, tiles)
         + "PORTAL_EOF\n"
         + f'echo "  плиток: {len(tiles)}"\n'
+    )
+
+
+def _portal_hash_script(cfg: Config) -> str:
+    """Подставить bcrypt-хеш пароля в basic_auth вместо заглушки.
+
+    Хеш считает сам Caddy на хосте (`caddy hash-password`): пароль не попадает в
+    Caddyfile открытым текстом и не хранится на диске. Читаем из stdin, чтобы
+    он не мелькнул в `ps`; в отличие от `--plaintext`, stdin требует перевода
+    строки, иначе Caddy падает с EOF. В алфавите bcrypt/argon2 нет `&`, `|`
+    и `\\`, поэтому подстановка в sed безопасна как есть.
+    """
+    if not cfg.portal_password:
+        return ""
+    return (
+        'echo "==> вход на портал: логин '
+        + cfg.portal_user
+        + ' (единый пароль для всех плиток)"\n'
+        "PORTAL_HASH=$(printf '%s\\n' "
+        + _sh_quote(cfg.portal_password)
+        + " | $SUDO docker exec -i caddy caddy hash-password)\n"
+        'if [ -z "$PORTAL_HASH" ]; then\n'
+        '  echo "ERROR: caddy hash-password не отдал хеш" >&2; exit 1\n'
+        "fi\n"
+        f'$SUDO sed -i "s|__PORTAL_HASH__|$PORTAL_HASH|" {CADDY_SITES_DIR}/portal.caddy\n'
     )
 
 
@@ -621,14 +665,44 @@ def _portal_verify_script(cfg: Config, tiles: list[Tile]) -> str:
         lines.append('  echo "  плиток нет"')
         return "\n".join(lines) + "\n"
 
-    def probe(url: str) -> str:
+    # с паролем портала каждая проба идёт с credentials, иначе все плитки
+    # отвечали бы 401 и проверка врала бы, что сервисы сломаны
+    auth = (
+        f" -u {_sh_quote(cfg.portal_user + ':' + cfg.portal_password)}"
+        if cfg.portal_password
+        else ""
+    )
+
+    def probe(url: str, with_auth: bool = True) -> str:
+        creds = auth if with_auth else ""
         return (
-            f"$($SUDO curl -sk -o /dev/null -w '%{{http_code}}' --resolve "
+            f"$($SUDO curl -sk -o /dev/null -w '%{{http_code}}'{creds} --resolve "
             f"{domain}:443:127.0.0.1 {url} 2>/dev/null || true)"
         )
 
+    if cfg.portal_password:
+        # анонимная проба — без credentials, иначе проверка «закрыт ли портал»
+        # сама себя обманывала бы и всегда получала 200
+        anon = probe(f"https://{domain}/", with_auth=False)
+        lines += [
+            f"ANON={anon}",
+            'case "$ANON" in',
+            "  401) echo '  OK: без пароля портал не отдаётся (401)' ;;",
+            "  000) echo '  MISSING: портал не отвечает (код 000)' ;;",
+            '  *) echo "  WARN: портал отдал анониму код $ANON — пароль не применился" ;;',
+            "esac",
+        ]
+
+    # На первом прогре Caddy только что перечитал конфиг и ещё выпускает
+    # сертификат (ACME занимает секунды): TLS-хендшейк не проходит, код 000,
+    # и портал ложно помечается MISSING. Поэтому ждём непустой код ответа.
     lines += [
-        f'CODE="{probe(f"https://{domain}/")}"',
+        'CODE=""',
+        f"for _ in $(seq 1 {_ACME_WAIT_SEC // 2}); do",
+        f'  CODE="{probe(f"https://{domain}/")}"',
+        '  [ "$CODE" != 000 ] && [ -n "$CODE" ] && break',
+        "  sleep 2",
+        "done",
         '[ -n "$CODE" ] || CODE=000',
         'case "$CODE" in',
         "  200) echo '  OK: страница плиток отдаётся' ;;",
@@ -1169,11 +1243,22 @@ if $SUDO docker ps --format '{{.Names}}' | grep -qx beszel; then
 else
   echo "  MISSING: beszel (hub)"
 fi
-if $SUDO docker ps --format '{{.Names}}' | grep -qx beszel-agent; then
-  echo "  OK: beszel-agent -> $($SUDO docker ps --filter name=^/beszel-agent$ --format '{{.Status}}')"
-else
-  echo "  MISSING: beszel-agent"
-fi
+# docker ps печатает и перезапускающиеся контейнеры: без KEY/TOKEN агент
+# падает и уходит в цикл, а наивная проверка рапортовала бы об этом как об OK
+AGENT_STATE="$($SUDO docker ps --filter name=^/beszel-agent$ --format '{{.Status}}')"
+case "$AGENT_STATE" in
+  Up*)
+    echo "  OK: beszel-agent -> $AGENT_STATE" ;;
+  "")
+    echo "  MISSING: beszel-agent" ;;
+  Restarting*)
+    echo "  ПРОБЛЕМА: beszel-agent перезапускается ($AGENT_STATE) — скорее всего"
+    echo "    не задан beszel_agent_key/beszel_agent_token: пустой ключ агент"
+    echo "    не принимает. Создайте систему в Hub (Add system -> key/token) и"
+    echo "    перепрогоните install-vps с --beszel-key/--beszel-token." ;;
+  *)
+    echo "  ПРОБЛЕМА: beszel-agent в состоянии '$AGENT_STATE'" ;;
+esac
 """
 
 DOZZLE_STACK = r"""
@@ -1191,8 +1276,7 @@ services:
       - "127.0.0.1:{port}:8080"
     environment:
       DOZZLE_BASE: {base}
-      DOZZLE_AUTH_PROVIDER: simple
-      DOZZLE_ENABLE_ACTIONS: "false"
+{auth_env}      DOZZLE_ENABLE_ACTIONS: "false"
       DOZZLE_ENABLE_SHELL: "false"
       DOZZLE_DISABLE_AVATARS: "true"
       DOZZLE_NO_ANALYTICS: "true"
@@ -1200,10 +1284,19 @@ services:
       DOZZLE_TIMEOUT: 30s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./users.yml:/data/users.yml:ro
-      - ./data:/data
+{users_mount}      - ./data:/data
 DOZZLE_EOF
-$SUDO docker compose -f {compose} up -d --remove-orphans
+# Dozzle держит список пользователей в памяти: после перезаписи users.yml
+# новый пароль не подхватывается, пока контейнер не пересоздан (проверено
+# на боевом хосте — вход оставался 401 до рестарта). Пересоздаём только
+# когда users.yml действительно перезаписан, иначе рвать контейнер на
+# каждом прогоне незачем.
+if [ -n "$DOZZLE_USERS_NEW" ]; then
+  echo "  users.yml перезаписан — пересоздаю контейнер, чтобы подхватил пароль"
+  $SUDO docker compose -f {compose} up -d --force-recreate --remove-orphans
+else
+  $SUDO docker compose -f {compose} up -d --remove-orphans
+fi
 $SUDO docker compose -f {compose} ps
 for _ in $(seq 1 30); do
   if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx dozzle; then break; fi
@@ -1221,9 +1314,11 @@ else
 fi
 CODE="$($SUDO curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}{base}/ 2>/dev/null || true)"
 [ -n "$CODE" ] || CODE=000
+echo "  вход: {auth_note}"
 case "$CODE" in
-  200|302|303|307) echo "  OK: dozzle отвечает на 127.0.0.1:{port}{base}/ (код $CODE — редирект" \
-      "на форму входа, авторизация включена)" ;;
+  200) echo "  OK: dozzle отвечает на 127.0.0.1:{port}{base}/ (код $CODE)" ;;
+  302|303|307) echo "  OK: dozzle отвечает на 127.0.0.1:{port}{base}/ (код $CODE — редирект" \
+      "на форму входа)" ;;
   401) echo "  OK: dozzle отвечает и требует входа (401)" ;;
   000) echo "  MISSING: dozzle не отвечает на 127.0.0.1:{port}{base}/" ;;
   *) echo "  WARN: dozzle ответил кодом $CODE" ;;
@@ -1250,6 +1345,37 @@ def _codename(cfg: Config, host: RemoteHost) -> str:
     return codename
 
 
+def _validate_portal_auth(cfg: Config) -> None:
+    """Проверки пароля портала: он закрывает только домен портала.
+
+    Отдельный сайт из caddy_sites пароль не покрывает, поэтому Dozzle с
+    выключенным собственным входом туда выносить нельзя — логи оказались бы
+    без авторизации вовсе.
+    """
+    if not cfg.portal_password:
+        return
+    if not cfg.caddy_portal:
+        raise ValueError(
+            "portal_password требует caddy_portal: вход настраивается в Caddy "
+            "на домене портала (--caddy-portal ДОМЕН)"
+        )
+    if any(ch in cfg.portal_password for ch in "\n\r\"':"):
+        raise ValueError(
+            "portal_password не должен содержать кавычки, двоеточие или перевод "
+            "строки: он передаётся в curl -u и caddy hash-password"
+        )
+    if not cfg.portal_user.strip():
+        raise ValueError("portal_user не должен быть пустым")
+    if cfg.dozzle and any(
+        str(cfg.dozzle_port) in raw.partition("=")[2] for raw in cfg.caddy_sites
+    ):
+        raise ValueError(
+            "dozzle с portal_password нельзя выносить на отдельный домен через "
+            "caddy_sites: там пароль портала не действует, а свой вход Dozzle "
+            "выключен. Оставьте логи под порталом или отключите portal_password"
+        )
+
+
 def _validate(cfg: Config) -> list[Tile]:
     """Проверки, которые обязаны случиться до отправки скрипта на хост.
 
@@ -1272,6 +1398,7 @@ def _validate(cfg: Config) -> list[Tile]:
             raise ValueError(f"Некорректный dozzle_path: {cfg.dozzle_path!r}")
     if cfg.caddy_portal and not _HOSTNAME_RE.match(cfg.caddy_portal):
         raise ValueError(f"Некорректный домен портала: {cfg.caddy_portal!r}")
+    _validate_portal_auth(cfg)
     for name in cfg.tools:
         if name not in _GITHUB_TOOLS:
             raise ValueError(
@@ -1315,8 +1442,16 @@ def _beszel_key_keep(compose: str, key: str, token: str) -> tuple[str, str]:
             continue
         marker = f"__BESZEL_{name}_KEEP__"
         var = f"BESZEL_OLD_{name}"
+        # на пустом хосте compose ещё нет: без этой проверки sed падает с
+        # кодом 2, а вместе с pipefail и set -e это роняет всю установку
+        # (воспроизведено на чистом Ubuntu 26.04). sed без пайпа в head —
+        # KEY/TOKEN в compose встречаются ровно один раз.
         reads.append(
-            f'{var}="$(sed -n \'s/^ *{name}: "\\(.*\\)"$/\\1/p\' {compose} | head -1)"\n'
+            f"if [ -f {compose} ]; then\n"
+            f"  {var}=\"$(sed -n 's/^ *{name}: \"\\(.*\\)\"$/\\1/p' {compose})\"\n"
+            f"else\n"
+            f'  {var}=""\n'
+            f"fi\n"
         )
         fixes.append(
             f'if [ -n "${var}" ]; then\n'
@@ -1338,7 +1473,15 @@ def _dozzle_users_block(cfg: Config, image: str) -> str:
     пользователь уже запомнил. Задать свой — dozzle_password в конфиге.
     Пароль передаётся в контейнер через stdin, а не --password, чтобы не
     светился в ps хоста.
+
+    Если задан portal_password, блок не создаётся вовсе: вход закрывает
+    пароль портала, а своя форма Dozzle только мешала бы лишним запросом.
     """
+    if cfg.portal_password:
+        return (
+            "DOZZLE_USERS_NEW=''\n"
+            'echo "  свой вход Dozzle выключен: пароль портала закрывает и логи"\n'
+        )
     create = (
         "  if ! echo \"$DOZZLE_PASS\" | $SUDO docker run --rm -i {image} generate "
         '{user} > "$TMP_USERS"; then\n'
@@ -1354,15 +1497,18 @@ def _dozzle_users_block(cfg: Config, image: str) -> str:
     ).format(image=image, user=_sh_quote(cfg.dozzle_user), users=DOZZLE_USERS)
     if cfg.dozzle_password:
         return (
+            'DOZZLE_USERS_NEW=1\n'
             'TMP_USERS="$(mktemp)"\n'
             f"DOZZLE_PASS={_sh_quote(cfg.dozzle_password)}\n"
             + create
             + f'  echo "  логин: {cfg.dozzle_user} (пароль из конфига)"\n'
         )
     return (
+        "DOZZLE_USERS_NEW=''\n"
         f"if [ -s {DOZZLE_USERS} ]; then\n"
         '  echo "  users.yml уже есть — пароль прежний, не трогаю"\n'
         "else\n"
+        '  DOZZLE_USERS_NEW=1\n'
         '  TMP_USERS="$(mktemp)"\n'
         "  DOZZLE_PASS=\"$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-16)\"\n"
         '  if [ -z "$DOZZLE_PASS" ]; then\n'
@@ -1389,6 +1535,9 @@ def _dozzle_script(cfg: Config) -> str:
         )
     image = f"amir20/dozzle:{DOZZLE_VERSION}"
     base = _dozzle_path(cfg)
+    # свой вход Dozzle нужен только когда портал не закрыт паролем
+    auth_env = "" if cfg.portal_password else "      DOZZLE_AUTH_PROVIDER: simple\n"
+    users_mount = "" if cfg.portal_password else "      - ./users.yml:/data/users.yml:ro\n"
     return DOZZLE_STACK.format(
         version=DOZZLE_VERSION,
         dir=DOZZLE_DIR,
@@ -1398,13 +1547,23 @@ def _dozzle_script(cfg: Config) -> str:
         image=image,
         port=cfg.dozzle_port,
         base=_yaml_str(base),
+        auth_env=auth_env,
+        users_mount=users_mount,
         users_block=_dozzle_users_block(cfg, image),
     )
 
 
 def _dozzle_verify_script(cfg: Config) -> str:
     """Проверка Dozzle (работает и в --verify-only)."""
-    return DOZZLE_VERIFY.format(port=cfg.dozzle_port, base=_dozzle_path(cfg))
+    return DOZZLE_VERIFY.format(
+        port=cfg.dozzle_port,
+        base=_dozzle_path(cfg),
+        auth_note=(
+            "пароль портала, своя форма Dozzle выключена"
+            if cfg.portal_password
+            else "собственная форма входа Dozzle"
+        ),
+    )
 
 
 def _beszel_script(cfg: Config) -> str:
