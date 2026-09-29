@@ -1390,7 +1390,7 @@ echo "  после перезагрузки zram поднимет zram-swap.serv
 """
 
 BESZEL_STACK = r"""
-echo "==> Beszel Hub + Agent (docker compose, порт {port})"
+echo "==> Beszel Hub + Agent (docker compose, порт {port}{bind_note})"
 $SUDO install -m 0755 -d {dir}
 {key_read}cat <<'BESZEL_EOF' | $SUDO tee {compose} >/dev/null
 services:
@@ -1401,7 +1401,7 @@ services:
     environment:
       APP_URL: {app_url}{auth_env}
     ports:
-      - "{port}:{port}"
+      - "{bind}:{port}:{port}"
     volumes:
       - ./beszel_data:/beszel_data
       - ./beszel_socket:/beszel_socket
@@ -1604,7 +1604,7 @@ for f in $($SUDO ls {sites_dir}/*.caddy 2>/dev/null); do
   [ -e "$f" ] || continue
   echo "  сайт: $(basename "$f" .caddy)"
 done
-"""
+{site_check}"""
 
 VERIFY = r"""
 echo "==> проверка"
@@ -1644,7 +1644,7 @@ fi
 """
 
 BESZEL_VERIFY = r"""
-{hub_check}# docker ps печатает и перезапускающиеся контейнеры: без KEY/TOKEN агент
+{hub_check}{image_check}# docker ps печатает и перезапускающиеся контейнеры: без KEY/TOKEN агент
 # падает и уходит в цикл, а наивная проверка рапортовала бы об этом как об OK
 AGENT_STATE="$($SUDO docker ps --filter name=^/beszel-agent$ --format '{{{{.Status}}}}')"
 case "$AGENT_STATE" in
@@ -1803,7 +1803,79 @@ if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx {name}; then
 else
   echo "  MISSING: {name}"
 fi
-{extra}"""
+{image_check}{extra}"""
+
+
+def _portainer_image_check(cfg: Config) -> str:
+    """Образы Portainer должны совпадать с version в конфиге."""
+    agent = _image_check("portainer-agent", f"portainer/agent:{cfg.portainer_version}")
+    if cfg.portainer_mode != "server":
+        return agent
+    return _image_check("portainer", f"portainer/portainer-ce:{cfg.portainer_version}") + agent
+
+
+def _image_check(container: str, image: str) -> str:
+    """Сверка работающего образа с версией из конфига.
+
+    Версии запинены не просто так: хаб и агент Beszel, сервер и агенты
+    Portainer должны совпадать. Разъехавшийся образ — это «работает у меня,
+    а после переустановки перестало», поэтому проверка говорит о расхождении
+    сразу, а не оставляет его до следующего обновления образа.
+    """
+    return (
+        # `|| true` обязателен: у сервера Portainer нет контейнера portainer-agent,
+        # а непустой код возврата docker inspect убил бы скрипт на `set -e`
+        f'IMG="$($SUDO docker inspect -f \'{{{{.Config.Image}}}}\' {container} 2>/dev/null || true)"\n'
+        'if [ -n "$IMG" ]; then\n'
+        f'  if [ "$IMG" = "{image}" ]; then\n'
+        '    echo "  OK: образ совпадает с конфигом -> $IMG"\n'
+        "  else\n"
+        f'    echo "  ПРОБЛЕМА: {container} работает на $IMG, в конфиге {image}"\n'
+        '    echo "    версии разъедутся: перепрогоните install-vps с этим же конфигом"\n'
+        "  fi\n"
+        "fi\n"
+    )
+
+
+def _caddy_site_check_script(cfg: Config) -> str:
+    """Проба каждого сайта из caddy_sites по HTTPS с самого хоста.
+
+    `caddy validate` ловит только синтаксис. Тихие поломки остаются за ним:
+    каталог смонтирован, но пуст; каталога нет вовсе; сертификат ещё не
+    выпущен; Caddy не перечитал конфиг. Проба идёт через `--resolve` на
+    127.0.0.1, поэтому внешний DNS и hairpin NAT провайдера не мешают.
+    """
+    if not cfg.caddy:
+        return ""
+    lines = [
+        "check_site() {",
+        '  domain="$1"; kind="$2"',
+        "  code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \\",
+        '    --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null)',
+        '  case "$code" in',
+        "    2*|3*) echo \"  OK: https://$domain/ -> $code\" ;;",
+        '    000|"") echo "  WARN: https://$domain/ не ответил — сертификат не выпущен'
+        ' или Caddy не перечитал конфиг" ;;',
+        '    404) if [ "$kind" = static ]; then',
+        '           echo "  WARN: https://$domain/ -> 404: каталог пуст или нет index-файла"',
+        "         else",
+        '           echo "  WARN: https://$domain/ -> 404: проверьте upstream"',
+        "         fi ;;",
+        '    *) echo "  WARN: https://$domain/ -> $code" ;;',
+        "  esac",
+        "}",
+    ]
+    for raw in cfg.caddy_sites:
+        domain, upstream, _ = _split_site(raw)
+        kind = "static" if upstream.startswith(("file:", "static:")) else "proxy"
+        lines.append(f'check_site "{domain}" {kind}')
+    return "\n".join(lines) + "\n"
+
+
+def _beszel_image_checks(cfg: Config) -> str:
+    image = f"henrygd/beszel:{cfg.beszel_version}"
+    agent = f"henrygd/beszel-agent:{cfg.beszel_version}"
+    return _image_check("beszel-agent", agent) + (_image_check("beszel", image) if cfg.beszel_mode == "hub" else "")
 
 
 def _codename(cfg: Config, host: RemoteHost) -> str:
@@ -2170,6 +2242,7 @@ def _beszel_verify_script(cfg: Config) -> str:
     outbound = cfg.beszel_mode == "agent" and bool(_beszel_hub_base(cfg))
     return BESZEL_VERIFY.format(
         hub_check="" if cfg.beszel_mode == "agent" else BESZEL_HUB_CHECK,
+        image_check=_beszel_image_checks(cfg),
         port_check=(
             BESZEL_AGENT_PORT_CHECK.format(
                 port=cfg.beszel_agent_port,
@@ -2241,9 +2314,16 @@ def _beszel_script(cfg: Config) -> str:
             allow_note=allow_note,
             **keys,
         ) + _beszel_verify_script(cfg)
+    # Хаб публикуется наружу только если его не проксирует Caddy: держать
+    # 0.0.0.0 на порту, куда и так ходят через 80/443, — лишний вход в хаб,
+    # а ufw от этого не спасает (Docker режет трафик мимо него, в DOCKER-USER).
+    bind = "127.0.0.1" if cfg.caddy else "0.0.0.0"
+    bind_note = ", только localhost — наружу его отдаёт Caddy" if cfg.caddy else ", на всех интерфейсах"
     return BESZEL_STACK.format(
         app_url=_yaml_str(public_url),
         public_url=public_url,
+        bind=bind,
+        bind_note=bind_note,
         auth_env=_beszel_auth_env(cfg),
         auth_warning=_beszel_auth_warning(cfg),
         **keys,
@@ -2461,7 +2541,7 @@ def _portainer_script(cfg: Config) -> str:
         token_read=edge_read,
         token_fix=edge_fix,
         name=name,
-    ) + PORTAINER_VERIFY.format(name=name, extra=extra)
+    ) + PORTAINER_VERIFY.format(name=name, extra=extra, image_check=_portainer_image_check(cfg))
 
 
 def install(cfg: Config, host: RemoteHost) -> None:
@@ -2529,7 +2609,7 @@ def install(cfg: Config, host: RemoteHost) -> None:
             static_volumes=_static_volumes(roots),
             static_check=_static_roots_check(roots),
         )
-        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
+        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR, site_check=_caddy_site_check_script(cfg))
         if cfg.caddy_portal:
             script += _portal_verify_script(cfg, tiles)
     if cfg.tools:
@@ -2547,11 +2627,12 @@ def verify(cfg: Config, host: RemoteHost) -> None:
         script += PORTAINER_VERIFY.format(
             name="portainer" if cfg.portainer_mode == "server" else "portainer-agent",
             extra=_portainer_extra_verify(cfg) if cfg.portainer_mode == "server" else "",
+            image_check=_portainer_image_check(cfg),
         )
     if cfg.dozzle:
         script += _dozzle_verify_script(cfg)
     if cfg.caddy:
-        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
+        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR, site_check=_caddy_site_check_script(cfg))
         if cfg.caddy_portal:
             script += _portal_verify_script(cfg, tiles)
     if cfg.tools:

@@ -871,6 +871,7 @@ class PortainerTests(unittest.TestCase):
         script = installer.PORTAINER_VERIFY.format(
             name="portainer",
             extra=installer._portainer_extra_verify(cfg),
+            image_check=installer._portainer_image_check(cfg),
         )
         bash_check(script)
         self.assertIn("https://127.0.0.1:9443/api/status", script)
@@ -1332,6 +1333,132 @@ class GeneratedScriptTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 install(full_config(caddy_sites=["rm -rf /=x"]), host)  # type: ignore[arg-type]
         self.assertEqual(host.script, "", "скрипт ушёл на хост до проверки конфига")
+
+
+class HostBindTests(unittest.TestCase):
+    """Публикация портов: наружу торчит только то, что не проксирует Caddy."""
+
+    def test_hub_bound_to_localhost_with_caddy(self) -> None:
+        script = installer._beszel_script(
+            full_config(beszel_mode="hub", beszel_port=8090)
+        )
+        bash_check(script)
+        self.assertIn('- "127.0.0.1:8090:8090"', script)
+        self.assertNotIn('- "8090:8090"', script)
+        self.assertIn("наружу его отдаёт Caddy", script)
+
+    def test_hub_bound_everywhere_without_caddy(self) -> None:
+        script = installer._beszel_script(
+            full_config(beszel_mode="hub", caddy=False, beszel_port=8090)
+        )
+        bash_check(script)
+        self.assertIn('- "0.0.0.0:8090:8090"', script)
+        self.assertIn("на всех интерфейсах", script)
+
+    def test_agent_stack_has_no_hub_port(self) -> None:
+        script = installer._beszel_script(full_config(beszel_mode="agent"))
+        bash_check(script)
+        self.assertNotIn(":8090:8090", script)
+
+
+class ImageVersionTests(unittest.TestCase):
+    """Дрейф версий: работающий образ сверяется с version из конфига."""
+
+    def test_beszel_checks_both_images(self) -> None:
+        script = installer._beszel_script(
+            full_config(beszel_mode="hub", beszel_version="0.20.0")
+        )
+        bash_check(script)
+        self.assertIn("image: henrygd/beszel:0.20.0", script)
+        self.assertIn("в конфиге henrygd/beszel:0.20.0", script)
+        self.assertIn("в конфиге henrygd/beszel-agent:0.20.0", script)
+        self.assertIn("docker inspect -f", script)
+
+    def test_agent_checks_only_agent_image(self) -> None:
+        script = installer._beszel_script(full_config(beszel_mode="agent"))
+        bash_check(script)
+        self.assertIn("в конфиге henrygd/beszel-agent:0.20.0", script)
+        self.assertNotIn("в конфиге henrygd/beszel:0.20.0", script)
+
+    def test_portainer_checks_server_and_agent(self) -> None:
+        script = installer._portainer_script(
+            full_config(portainer=True, portainer_version="2.45.1")
+        )
+        bash_check(script)
+        self.assertIn("в конфиге portainer/portainer-ce:2.45.1", script)
+        self.assertIn("в конфиге portainer/agent:2.45.1", script)
+
+    def test_portainer_agent_checks_only_agent_image(self) -> None:
+        script = installer._portainer_script(
+            full_config(portainer=True, portainer_mode="agent")
+        )
+        bash_check(script)
+        self.assertIn("в конфиге portainer/agent:2.45.1", script)
+        self.assertNotIn("portainer-ce", script)
+
+    def test_missing_container_does_not_abort(self) -> None:
+        # у сервера Portainer контейнера portainer-agent нет: docker inspect
+        # вернёт непустой код, и на `set -e` весь скрипт упал бы на ровном месте
+        snippet = installer._image_check("no-such-container-xyz", "img:1.2.3")
+        script = "set -euo pipefail\nSUDO=\n" + snippet + 'echo "СКРИПТ ДОШЁЛ ДО КОНЦА"\n'
+        proc = subprocess.run([BASH, "-c", script], text=True, capture_output=True, check=False)
+        self.assertIn("СКРИПТ ДОШЁЛ ДО КОНЦА", proc.stdout, msg=proc.stderr)
+        self.assertNotIn("ПРОБЛЕМА", proc.stdout)
+
+    def test_verify_only_keeps_image_check(self) -> None:
+        host = FakeHost()
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            verify(
+                full_config(portainer=True, portainer_domain="portainer.example.com"),
+                host,  # type: ignore[arg-type]
+            )
+        bash_check(host.script)
+        self.assertIn("в конфиге henrygd/beszel:0.20.0", host.script)
+        self.assertIn("в конфиге portainer/portainer-ce:2.45.1", host.script)
+
+
+class SiteProbeTests(unittest.TestCase):
+    """caddy validate ловит синтаксис, но не «каталог пуст» и не сертификат."""
+
+    def _cfg(self, **overrides) -> Config:
+        kwargs = {
+            "caddy_sites": [
+                "etc.example.com=file:/var/www/etc|browse",
+                "shop.example.com=http://127.0.0.1:3000",
+            ]
+        }
+        kwargs.update(overrides)
+        return full_config(**kwargs)
+
+    def test_probe_every_site_over_resolve(self) -> None:
+        script = installer._caddy_site_check_script(self._cfg())
+        bash_check("check_site() { :; }\n" + script)
+        self.assertIn('--resolve "$domain:443:127.0.0.1"', script)
+        self.assertIn('check_site "etc.example.com" static', script)
+        self.assertIn('check_site "shop.example.com" proxy', script)
+        # хвост опций не должен попасть в пробу
+        self.assertNotIn("browse", script.split('check_site "etc.example.com"')[1])
+
+    def test_static_404_mentions_index(self) -> None:
+        script = installer._caddy_site_check_script(self._cfg())
+        self.assertIn("каталог пуст или нет index-файла", script)
+        self.assertIn("проверьте upstream", script)
+        # нулевой код = TLS/caddy, а не 404
+        self.assertIn('000|"")', script)
+
+    def test_no_probe_without_caddy(self) -> None:
+        self.assertEqual(installer._caddy_site_check_script(self._cfg(caddy=False)), "")
+
+    def test_probe_in_verify_script(self) -> None:
+        host = FakeHost()
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            verify(self._cfg(), host)  # type: ignore[arg-type]
+        bash_check(host.script)
+        self.assertIn('check_site "etc.example.com" static', host.script)
+
+    def test_no_probe_for_tls_based_proxy(self) -> None:
+        cfg = self._cfg(caddy_sites=["api.example.com=https://backend:8443"])
+        self.assertIn('check_site "api.example.com" proxy', installer._caddy_site_check_script(cfg))
 
 
 if __name__ == "__main__":
