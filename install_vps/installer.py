@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import re
 import subprocess
@@ -109,7 +110,18 @@ _HOSTNAME_RE = re.compile(
     r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
 )
 _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+# тег образа Beszel: hub и agent обязаны совпадать, «latest» недопустим
+_SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# адрес или CIDR: beszel_agent_allow открывает порт агента конкретным хостам
+_CIDR_RE = re.compile(
+    r"^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9a-fA-F:]{2,39}(/[0-9]{1,3})?$"
+)
+# каталог статики для caddy_site вида "домен=file:/var/www"
+_STATIC_ROOT_RE = re.compile(r"^/[A-Za-z0-9._/-]*$")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# пути внутри контейнера caddy, которые нельзя перекрывать статикой
+_STATIC_ROOT_RESERVED = ("/etc/caddy", "/srv/portal", "/data", "/config")
 
 # диапазон непривилегированных портов: всё, что ниже 1024, требует Capabilities
 _PORT_MIN = 1024
@@ -226,23 +238,101 @@ def _caddy_site_block(domain: str, upstream: str) -> str:
     return f"{domain} {{\n\treverse_proxy {upstream}\n}}\n"
 
 
-def _caddy_beszel_block(domain: str, port: int) -> str:
+def _caddy_static_block(cfg: Config, domain: str, root: str) -> str:
+    """Сайт-статика: домен -> каталог на хосте (вместо прокси).
+
+    Нужен, когда 80/443 переезжают с другого веб-сервера (например с
+    lighttpd) на Caddy: его содержимое переносится сайтом, а не выбрасывается.
+    """
+    return (
+        f"{domain} {{\n"
+        + _access_log_block(cfg)
+        + f"\troot * {root}\n"
+        "\tfile_server\n"
+        "\tencode gzip\n"
+        "}\n"
+    )
+
+
+def _access_log_block(cfg: Config) -> str:
+    """Директива access-лога в stdout контейнера Caddy.
+
+    Логи уезжают в docker logs caddy и упираются в ротацию из daemon.json,
+    поэтому объём ограничен. Формат json — по нему удобно фильтровать
+    запросы конкретного клиента, когда плитка не открывается.
+    """
+    if not cfg.caddy_access_log:
+        return ""
+    return "\tlog {\n\t\toutput stdout\n\t\tformat json\n\t}\n"
+
+
+def _caddy_beszel_block(cfg: Config, domain: str, port: int) -> str:
     """Сайт Beszel Hub с настройками из официальной документации beszel.dev.
 
     request_body max_size — Beszel шлёт большие тела при импорте/экспорте,
     read_timeout 360s — долгие опросы и WebSocket агентов с universal token.
+    flush_interval -1 — бандл интерфейса (~490 КБ) не должен уходить одним
+    куском: на канале с буксующим TCP-окном браузер рвёт такую загрузку и
+    показывает белую страницу.
     """
     return (
         f"{domain} {{\n"
-        f"\trequest_body {{\n"
+        + _access_log_block(cfg)
+        + f"\trequest_body {{\n"
         f"\t\tmax_size 10MB\n"
         f"\t}}\n"
         f"\treverse_proxy 127.0.0.1:{port} {{\n"
+        f"\t\tflush_interval -1\n"
         f"\t\ttransport http {{\n"
         f"\t\t\tread_timeout 360s\n"
         f"\t\t}}\n"
         f"\t}}\n"
         f"}}\n"
+    )
+
+
+def _caddy_portainer_block(cfg: Config, domain: str, port: int) -> str:
+    """Сайт Portainer CE: UI отдаёт свой самоподписанный сертификат.
+
+    tls_insecure_skip_verify — сертификат внутри контейнера Portainer самоподписанный,
+    доверять ему нельзя (это соединение по localhost), а Caddy иначе откажется
+    проксировать. Снаружи (до Caddy) — нормальный сертификат Let's Encrypt.
+    request_body 50MB — деплой стека с картинками/конфигами; read_timeout 1h —
+    долгие операции (сборка образа, обновление стека).
+    """
+    return (
+        f"{domain} {{\n"
+        + _access_log_block(cfg)
+        + "\trequest_body {\n\t\tmax_size 50MB\n\t}\n"
+        + f"\treverse_proxy 127.0.0.1:{port} {{\n"
+        "\t\tflush_interval -1\n"
+        "\t\ttransport http {\n"
+        "\t\t\ttls_insecure_skip_verify\n"
+        "\t\t\tread_timeout 1h\n"
+        "\t\t}\n"
+        "\t}\n"
+        "}\n"
+    )
+
+
+def _caddy_portainer_tunnel_block(cfg: Config, domain: str) -> str:
+    """Сайт на :80 для туннеля edge-агентов Portainer.
+
+    Агент в edge-режиме умеет только `ws://` (chisel не умеет TLS сам, а
+    EdgeKey хранит адрес без схемы), поэтому туннель должен быть доступен на
+    обычном http-порту. Провайдер закрывает всё, кроме 80/443, и Caddy эти
+    порты уже занял — заворачиваем websocket на локальный порт контейнера,
+    всё остальное с :80 отправляем на https. Именно так агенты и ходят:
+    в EdgeKey попадает `<домен>:80`.
+    """
+    return (
+        f"http://{domain} {{\n"
+        "\t@ws header Connection *Upgrade*\n"
+        f"\treverse_proxy @ws 127.0.0.1:{cfg.portainer_tunnel_local_port}\n"
+        "\n"
+        "\t@notws not header Connection *Upgrade*\n"
+        "\tredir @notws https://{host}{uri} 308\n"
+        "}\n"
     )
 
 
@@ -274,11 +364,61 @@ def _write_site_script(name: str, content: str) -> str:
     )
 
 
+def _static_roots(cfg: Config) -> list[str]:
+    """Каталоги статики из caddy_site вида "домен=file:/var/www" (без дублей)."""
+    roots: list[str] = []
+    for raw in cfg.caddy_sites:
+        _, _, upstream = raw.partition("=")
+        upstream = upstream.strip()
+        if not upstream.startswith(("file:", "static:")):
+            continue
+        root = upstream.split(":", 1)[1].strip()
+        if root and root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _static_volumes(roots: list[str]) -> str:
+    """Bind-mount строки для compose: каталог статики виден контейнеру.
+
+    Статика лежит на хосте (`/var/www` и подобное), а `network_mode: host`
+    не даёт доступу к файловой системе хоста — без явного mount Caddy отдаёт
+    404 на каждый файл.
+    """
+    return "".join(f"      - {root}:{root}:ro\n" for root in roots)
+
+
+def _static_roots_check(roots: list[str]) -> str:
+    """Предупредить о несуществующем каталоге: docker создал бы пустой каталог."""
+    if not roots:
+        return ""
+    checks = "".join(
+        f'if [ ! -d "{root}" ]; then\n'
+        f'  echo "  ВНИМАНИЕ: каталог статики {root} не найден — сайт отдаст 404"\n'
+        "fi\n"
+        for root in roots
+    )
+    return checks
+
+
 def _caddy_sites_script(cfg: Config, portal: bool = False) -> str:
     """Готовые bash-фрагменты, создающие по файлу на каждый сайт."""
     sites: list[tuple[str, str]] = []
     if cfg.caddy_domain:
-        sites.append(("beszel", _caddy_beszel_block(cfg.caddy_domain, cfg.beszel_port)))
+        sites.append(("beszel", _caddy_beszel_block(cfg, cfg.caddy_domain, cfg.beszel_port)))
+    if cfg.portainer and cfg.portainer_mode == "server" and cfg.portainer_domain:
+        sites.append(
+            (
+                "portainer",
+                _caddy_portainer_block(cfg, cfg.portainer_domain, cfg.portainer_port),
+            )
+        )
+        sites.append(
+            (
+                "portainer-tunnel",
+                _caddy_portainer_tunnel_block(cfg, cfg.portainer_domain),
+            )
+        )
     for raw in cfg.caddy_sites:
         domain, sep, upstream = raw.partition("=")
         if not sep:
@@ -288,6 +428,21 @@ def _caddy_sites_script(cfg: Config, portal: bool = False) -> str:
         domain, upstream = domain.strip(), upstream.strip()
         if not _HOSTNAME_RE.match(domain):
             raise ValueError(f"Некорректный домен в caddy_site: {domain!r}")
+        if upstream.startswith(("file:", "static:")):
+            root = upstream.split(":", 1)[1].strip()
+            if not _STATIC_ROOT_RE.match(root) or ".." in root:
+                raise ValueError(
+                    f"Некорректный каталог статики в caddy_site: {root!r}; нужен "
+                    "абсолютный путь без пробелов и '..', напр. file:/var/www"
+                )
+            if any(root == r or root.startswith(r + "/") for r in _STATIC_ROOT_RESERVED):
+                raise ValueError(
+                    f"Каталог статики {root!r} перекрывает служебный путь контейнера "
+                    f"Caddy ({', '.join(_STATIC_ROOT_RESERVED)}) — выберите другой, "
+                    "напр. file:/var/www"
+                )
+            sites.append((domain, _caddy_static_block(cfg, domain, root)))
+            continue
         if not _UPSTREAM_RE.match(upstream):
             raise ValueError(f"Некорректный upstream в caddy_site: {upstream!r}")
         sites.append((domain, _caddy_site_block(domain, upstream)))
@@ -311,6 +466,7 @@ def _caddy_sites_script(cfg: Config, portal: bool = False) -> str:
 # внешний адрес. Новый сервис = новая строка в caddy_tiles, Caddyfile руками
 # править не нужно.
 # --------------------------------------------------------------------------
+_PORT_EDGE_KEY_FIELDS = 4  # url|host:port|fingerprint|endpoint_id в EDGE_KEY
 _PORTAL_PATH_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$")
 _EXTERNAL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -451,6 +607,27 @@ def _beszel_public_url(cfg: Config) -> str:
     return f"http://localhost:{cfg.beszel_port}"
 
 
+def _beszel_hub_base(cfg: Config) -> str:
+    """HUB_URL для режима agent: агент сам звонит в хаб.
+
+    Пусто — обычная схема: хаб сам ходит к агенту по его порту (LISTEN).
+    Значение нужно, когда провайдер узла режет входящие порты: тогда агент
+    инициирует исходящее WebSocket-соединение с хабом. Без схемы подставляем
+    https:// — хаб обычно стоит за Caddy с TLS.
+    """
+    url = cfg.beszel_hub_url.strip().rstrip("/")
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    if not _UPSTREAM_RE.match(url):
+        raise ValueError(
+            f"beszel_hub_url: неверный адрес «{cfg.beszel_hub_url}» — "
+            "ожидается https://<домен>[:порт]"
+        )
+    return url
+
+
 def _tiles(cfg: Config) -> list[Tile]:
     """Плитки портала: из конфига + автоплитки мониторинга и логов.
 
@@ -459,9 +636,17 @@ def _tiles(cfg: Config) -> list[Tile]:
     вне портала, и ссылаться на него нужно было бы отдельной строкой.
     Плитка Dozzle добавляется по той же причине: путь и upstream известны из
     конфига, а прокси для неё особенный (keep + flush_interval).
+    Плитка Portainer — внешняя ссылка на его собственный домен: под базовым
+    путём портала Portainer не работает (его роутер жёстко рассчитан на корень).
     """
     tiles = [_parse_tile(raw, cfg.caddy_portal) for raw in cfg.caddy_tiles]
-    if cfg.beszel and cfg.caddy and cfg.caddy_portal and not cfg.caddy_domain:
+    if (
+        cfg.beszel
+        and cfg.beszel_mode == "hub"
+        and cfg.caddy
+        and cfg.caddy_portal
+        and not cfg.caddy_domain
+    ):
         path = _beszel_path(cfg)
         tiles.insert(
             0,
@@ -490,6 +675,23 @@ def _tiles(cfg: Config) -> list[Tile]:
                 streaming=True,
             ),
         )
+    if (
+        cfg.portainer
+        and cfg.portainer_mode == "server"
+        and cfg.caddy
+        and cfg.caddy_portal
+        and cfg.portainer_domain
+    ):
+        tiles.insert(
+            0 if not tiles else 1,
+            Tile(
+                name="Контейнеры",
+                href=f"https://{cfg.portainer_domain}/",
+                hint=cfg.portainer_domain,
+                path="",
+                upstream="",
+            ),
+        )
     paths = [tile.path for tile in tiles if tile.path]
     for path in paths:
         for other in paths:
@@ -511,6 +713,7 @@ def _portal_caddy_block(cfg: Config, tiles: list[Tile]) -> str:
     """
     lines = [
         f"{cfg.caddy_portal} {{",
+        _access_log_block(cfg).rstrip("\n"),
         "\tencode gzip zstd",
         "\trequest_body {",
         "\t\tmax_size 10MB",
@@ -539,9 +742,15 @@ def _portal_caddy_block(cfg: Config, tiles: list[Tile]) -> str:
         keyword = "handle" if tile.keep_prefix else "handle_path"
         lines.append(f"\t{keyword} {tile.path}/* {{")
         if tile.beszel:
-            # настройки из документации beszel.dev: импорт/экспорт систем
+            # настройки из документации beszel.dev: импорт/экспорт систем.
+            # flush_interval -1 обязателен и здесь: без него большой JS-бандл
+            # Hub (490 КБ) уходит одним куском, и на канале с буксующим
+            # TCP-окном браузер рвёт загрузку — страница остаётся белой.
+            # Кэш на бандлы приложения ставят сами (по хешу в имени), свой
+            # Cache-Control не добавляем: он бы продублировался в ответе
             lines += [
                 f"\t\treverse_proxy {tile.upstream} {{",
+                "\t\t\tflush_interval -1",
                 "\t\t\ttransport http {",
                 "\t\t\t\tread_timeout 360s",
                 "\t\t\t}",
@@ -616,8 +825,9 @@ def _portal_script(cfg: Config, tiles: list[Tile]) -> str:
             'echo "  Добавьте --caddy-tile НАЗВАНИЕ=/путь=upstream."\n'
         )
     return (
-        _write_site_script("portal", _portal_caddy_block(cfg, tiles))
-        + _portal_hash_script(cfg)
+        _portal_hash_compute_script(cfg)
+        + _write_site_script("portal", _portal_caddy_block(cfg, tiles))
+        + _portal_hash_apply_script()
         + f"echo \"==> портал {cfg.caddy_portal}: страница плиток\"\n"
         + f"$SUDO install -m 0755 -d {PORTAL_DIR}\n"
         + f"cat <<'PORTAL_EOF' | $SUDO tee {PORTAL_INDEX} >/dev/null\n"
@@ -627,14 +837,18 @@ def _portal_script(cfg: Config, tiles: list[Tile]) -> str:
     )
 
 
-def _portal_hash_script(cfg: Config) -> str:
-    """Подставить bcrypt-хеш пароля в basic_auth вместо заглушки.
+def _portal_hash_compute_script(cfg: Config) -> str:
+    """Посчитать bcrypt-хеш пароля портала (в $PORTAL_HASH).
 
     Хеш считает сам Caddy на хосте (`caddy hash-password`): пароль не попадает в
     Caddyfile открытым текстом и не хранится на диске. Читаем из stdin, чтобы
     он не мелькнул в `ps`; в отличие от `--plaintext`, stdin требует перевода
     строки, иначе Caddy падает с EOF. В алфавите bcrypt/argon2 нет `&`, `|`
     и `\\`, поэтому подстановка в sed безопасна как есть.
+
+    Считается ДО записи portal.caddy: заглушка `__PORTAL_HASH__` невалидна для
+    Caddy, и если она окажется в подключённом каталоге, контейнер не поднимется
+    (а на следующем прогоне ещё и заблокирует `docker exec` для хеша).
     """
     if not cfg.portal_password:
         return ""
@@ -648,7 +862,42 @@ def _portal_hash_script(cfg: Config) -> str:
         'if [ -z "$PORTAL_HASH" ]; then\n'
         '  echo "ERROR: caddy hash-password не отдал хеш" >&2; exit 1\n'
         "fi\n"
-        f'$SUDO sed -i "s|__PORTAL_HASH__|$PORTAL_HASH|" {CADDY_SITES_DIR}/portal.caddy\n'
+    )
+
+
+def _portal_hash_apply_script() -> str:
+    """Подставить посчитанный хеш в только что записанный portal.caddy."""
+    return (
+        f'$SUDO sed -i "s|__PORTAL_HASH__|$PORTAL_HASH|" '
+        f"{CADDY_SITES_DIR}/portal.caddy\n"
+        'if grep -q "__PORTAL_HASH__" '
+        f"{CADDY_SITES_DIR}/portal.caddy; then\n"
+        '  echo "ERROR: в portal.caddy осталась заглушка хеша" >&2; exit 1\n'
+        "fi\n"
+    )
+
+
+def _portal_cleanup_script() -> str:
+    """Убрать битый portal.caddy перед первым стартом контейнера.
+
+    Заглушка `__PORTAL_HASH__` (или пустой хеш) невалидна для Caddy: контейнер
+    уходит в рестарт, а следующий прогон падает на `docker exec` для хеша.
+    Настоящий хеш всегда начинается с `$2a$`/`$2b$`/`$2y$`/`$argon2id$`.
+
+    Контейнер читает конфиг только при старте, а после серии падений docker
+    ещё держит паузу перед рестартом (backoff до минуты) — поэтому после
+    удаления битого файла контейнер пересоздаётся принудительно, иначе он
+    продолжит падать на старой версии конфига.
+    """
+    site = f"{CADDY_SITES_DIR}/portal.caddy"
+    # ERE: без `\|` (это литеральный пайп, а не alternation)
+    return (
+        f"if [ -f {site} ] && ! grep -qE '\\$(2[aby]|argon2id)\\$' {site}; then\n"
+        f'  echo "  битый portal.caddy (нет хеша пароля) — удаляю, он перезапишется"\n'
+        f"  $SUDO rm -f {site}\n"
+        f"  $SUDO docker compose -f {CADDY_COMPOSE} up -d --force-recreate "
+        "--remove-orphans\n"
+        "fi\n"
     )
 
 
@@ -868,6 +1117,12 @@ DOZZLE_DIR = "/opt/dozzle"
 DOZZLE_COMPOSE = "/opt/dozzle/docker-compose.yml"
 DOZZLE_USERS = "/opt/dozzle/users.yml"
 DOZZLE_DATA = "/opt/dozzle/data"
+PORTAINER_DIR = "/opt/portainer"
+PORTAINER_COMPOSE = "/opt/portainer/docker-compose.yml"
+# пароль начального admin: отдельный файл 0600 внутри контейнера, чтобы он не
+# светился ни в compose, ни в docker inspect (там видно лишь имя файла)
+PORTAINER_ADMIN_FILE = f"{PORTAINER_DIR}/admin-password"  # путь на хосте
+PORTAINER_ADMIN_SECRET = "/run/portainer-admin-password"  # путь внутри контейнера
 
 # Caddy: постоянные пути. Сайты лежат отдельными файлами в sites/ и
 # подключаются через import — новый сайт добавляется одним файлом.
@@ -1073,7 +1328,7 @@ $SUDO install -m 0755 -d {dir}
 {key_read}cat <<'BESZEL_EOF' | $SUDO tee {compose} >/dev/null
 services:
   beszel:
-    image: henrygd/beszel:latest
+    image: henrygd/beszel:{beszel_version}
     container_name: beszel
     restart: unless-stopped
     environment:
@@ -1085,7 +1340,7 @@ services:
       - ./beszel_socket:/beszel_socket
 
   beszel-agent:
-    image: henrygd/beszel-agent:latest
+    image: henrygd/beszel-agent:{beszel_version}
     container_name: beszel-agent
     restart: unless-stopped
     network_mode: host
@@ -1099,13 +1354,15 @@ services:
       KEY: "{key}"
       TOKEN: "{token}"
 BESZEL_EOF
-{key_fix}{auth_warning}if [ -z {key_quoted} ]; then
+{key_fix}{auth_warning}# Предупреждение — про фактический compose, а не про конфиг: сохранённый
+# с хоста ключ в файле есть, и ругаться незачем
+if $SUDO grep -qE '^      KEY: ""$' {compose}; then
   echo "  ВНИМАНИЕ: не задан beszel_agent_key — новый агент не сможет подключиться."
   echo "  Откройте http://<host>:{port} -> создайте пользователя -> Add system,"
   echo "  скопируйте ключ агента в beszel_agent_key (config.toml или --beszel-key)"
   echo "  и запустите install-vps повторно."
 fi
-if [ -z {token_quoted} ]; then
+if $SUDO grep -qE '^      TOKEN: ""$' {compose}; then
   echo "  ВНИМАНИЕ: не задан beszel_agent_token — новый агент не сможет подключиться."
   echo "  Токен виден в том же диалоге Add system (или в настройках -> tokens)."
 fi
@@ -1115,9 +1372,82 @@ echo "  Hub (внутренний): http://localhost:{port}"
 echo "  Hub (публичный): {public_url}"
 """
 
+# Режим agent: на хосте только агент, хаб живёт на другом сервере и сам ходит
+# к агенту. Compose пишется в тот же файл, поэтому `up -d --remove-orphans`
+# сам убирает контейнер хаба при переводе узла в этот режим.
+BESZEL_AGENT_STACK = r"""
+echo "==> Beszel Agent (docker compose, порт {agent_port}, хаб — на другом хосте)"
+$SUDO install -m 0755 -d {dir}
+{key_read}cat <<'BESZEL_EOF' | $SUDO tee {compose} >/dev/null
+services:
+  beszel-agent:
+    image: henrygd/beszel-agent:{beszel_version}
+    container_name: beszel-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./beszel_agent_data:/var/lib/beszel-agent
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      LISTEN: {agent_port}{hub_env}
+      KEY: "{key}"
+      TOKEN: "{token}"
+BESZEL_EOF
+{key_fix}{allow}# Предупреждение — про фактический compose, а не про конфиг: если ключ
+# сохранён с хоста, он там есть, и ругаться незачем
+if $SUDO grep -qE '^      KEY: ""$' {compose}; then
+  echo "  ВНИМАНИЕ: не задан beszel_agent_key — хаб не увидит эту систему."
+  echo "  В веб-UI хаба: Add system -> скопируйте ключ в beszel_agent_key"
+  echo "  (config.toml или --beszel-key) и запустите install-vps повторно."
+fi
+if $SUDO grep -qE '^      TOKEN: ""$' {compose}; then
+  echo "  ВНИМАНИЕ: не задан beszel_agent_token — хаб не увидит эту систему."
+  echo "  Токен виден в том же диалоге Add system (или в настройках -> tokens)."
+fi
+$SUDO docker compose -f {compose} up -d --remove-orphans
+$SUDO docker compose -f {compose} ps
+{mode_note}
+{allow_note}"""
+
+BESZEL_AGENT_ALLOW = r"""
+ufw_ok=0
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+  ufw_ok=1
+{ufw_rules}else
+  echo "  ВНИМАНИЕ: ufw не активен — правила {port} не применены."
+  echo "  Убедитесь, что порт {port} доступен с хаба ({allow}), иначе"
+  echo "  система в хабе останется без данных."
+fi
+"""
+
+BESZEL_AGENT_ALLOW_NOTE = r"""
+if [ "$ufw_ok" = "1" ]; then
+  echo "  порт {port} открыт только для: {allow}"
+fi
+"""
+
 CADDY = r"""
 echo "==> Caddy: обратный прокси с автоматическим HTTPS (порты 80/443)"
 $SUDO install -m 0755 -d {dir} {sites_dir} {portal_dir}
+# Превентивная проверка: контейнер с именем caddy из чужого compose-проекта
+# (например dockprom) не даст создать наш. Останавливать и переименовывать
+# чужой контейнер установщик не станет — это решение администратора хоста.
+FOREIGN_CADDY=""
+for CID in $($SUDO docker ps -a --filter name=^/caddy$ --format '{{{{.ID}}}}'); do
+  WD="$($SUDO docker inspect -f '{{{{index .Config.Labels "com.docker.compose.project.working_dir"}}}}' "$CID")"
+  [ "$WD" = "{dir}" ] || FOREIGN_CADDY="$CID"
+done
+if [ -n "$FOREIGN_CADDY" ]; then
+  PROJECT="$($SUDO docker inspect -f '{{{{index .Config.Labels "com.docker.compose.project"}}}}' "$FOREIGN_CADDY")"
+  echo "  ПРОБЛЕМА: имя контейнера caddy занято (проект '${{PROJECT:-нет}}'):"
+  $SUDO docker inspect -f '    образ: {{{{.Config.Image}}}}' "$FOREIGN_CADDY"
+  echo "    Если он больше не нужен:"
+  echo "      $SUDO docker rm -f caddy"
+  echo "    Если нужен (например, обслуживает другие порты) — освободите имя:"
+  echo "      $SUDO docker stop caddy && $SUDO docker rename caddy caddy-prev"
+  echo "    и повторите install-vps."
+  exit 1
+fi
 cat <<'CADDY_COMPOSE_EOF' | $SUDO tee {compose} >/dev/null
 services:
   caddy:
@@ -1131,7 +1461,7 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./sites:/etc/caddy/sites:ro
       - ./portal:/srv/portal:ro
-      - caddy_data:/data
+{static_volumes}      - caddy_data:/data
       - caddy_config:/config
     logging:
       driver: json-file
@@ -1146,13 +1476,22 @@ CADDY_COMPOSE_EOF
 cat <<'CADDYFILE_EOF' | $SUDO tee {dir}/Caddyfile >/dev/null
 {caddyfile}
 CADDYFILE_EOF
-{sites}
-$SUDO docker compose -f {compose} up -d --remove-orphans
-$SUDO docker compose -f {compose} ps
+# Контейнер поднимается ДО сайтов и портала: хеш пароля портала считает сам
+# Caddy (caddy hash-password через docker exec), то есть нужен живой контейнер.
+# На первом запуске сайтов ещё нет — корневой Caddyfile просто импортирует
+# пустой каталог, и Caddy стартует нормально; ниже он перечитает конфиг.
+{static_check}{portal_cleanup}$SUDO docker compose -f {compose} up -d --remove-orphans
 for _ in $(seq 1 30); do
   if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx caddy; then break; fi
   sleep 2
 done
+if ! $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx caddy; then
+  echo "  ОШИБКА: контейнер caddy не запустился:"
+  $SUDO docker compose -f {compose} logs 2>&1 | tail -20 | sed 's/^/    /'
+  exit 1
+fi
+{sites}
+$SUDO docker compose -f {compose} ps
 if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx caddy; then
   # конфиг примонтирован, но Caddy держит старый в памяти — нужен reload,
   # иначе повторный прогон ничего не применит
@@ -1163,7 +1502,7 @@ if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx caddy; then
     $SUDO docker restart caddy >/dev/null
   fi
 else
-  echo "  ОШИБКА: контейнер caddy не запустился:"
+  echo "  ОШИБКА: контейнер caddy перестал работать во время установки:"
   $SUDO docker compose -f {compose} logs 2>&1 | tail -20 | sed 's/^/    /'
   exit 1
 fi
@@ -1238,14 +1577,9 @@ fi
 """
 
 BESZEL_VERIFY = r"""
-if $SUDO docker ps --format '{{.Names}}' | grep -qx beszel; then
-  echo "  OK: beszel (hub) -> $($SUDO docker ps --filter name=^/beszel$ --format '{{.Status}}')"
-else
-  echo "  MISSING: beszel (hub)"
-fi
-# docker ps печатает и перезапускающиеся контейнеры: без KEY/TOKEN агент
+{hub_check}# docker ps печатает и перезапускающиеся контейнеры: без KEY/TOKEN агент
 # падает и уходит в цикл, а наивная проверка рапортовала бы об этом как об OK
-AGENT_STATE="$($SUDO docker ps --filter name=^/beszel-agent$ --format '{{.Status}}')"
+AGENT_STATE="$($SUDO docker ps --filter name=^/beszel-agent$ --format '{{{{.Status}}}}')"
 case "$AGENT_STATE" in
   Up*)
     echo "  OK: beszel-agent -> $AGENT_STATE" ;;
@@ -1259,6 +1593,20 @@ case "$AGENT_STATE" in
   *)
     echo "  ПРОБЛЕМА: beszel-agent в состоянии '$AGENT_STATE'" ;;
 esac
+{port_check}"""
+
+BESZEL_HUB_CHECK = """if $SUDO docker ps --format '{{.Names}}' | grep -qx beszel; then
+  echo "  OK: beszel (hub) -> $($SUDO docker ps --filter name=^/beszel$ --format '{{.Status}}')"
+else
+  echo "  MISSING: beszel (hub)"
+fi
+"""
+
+BESZEL_AGENT_PORT_CHECK = """if $SUDO ss -ltn "sport = :{port}" | grep -q LISTEN; then
+  echo "  OK: агент слушает {port}"
+else
+  echo "  {fail}"
+fi
 """
 
 DOZZLE_STACK = r"""
@@ -1325,6 +1673,71 @@ case "$CODE" in
 esac
 """
 
+PORTAINER_STACK = r"""
+echo "==> Portainer CE ({mode}, docker compose)"
+$SUDO install -m 0755 -d {dir}
+{admin_write}{token_read}cat <<'PORTAINER_EOF' | $SUDO tee {compose} >/dev/null
+services:
+{services}PORTAINER_EOF
+{token_fix}
+# контейнер с таким именем мог остаться от другого compose-проекта (например
+# после переноса каталога) — тогда compose откажется создавать свой. Имя
+# принадлежит этому шаблону, поэтому чужой контейнер убираем, свой compose
+# поднимет заново с актуальными настройками.
+$SUDO docker rm -f {name} >/dev/null 2>&1 || true
+$SUDO docker compose -f {compose} up -d --remove-orphans
+$SUDO docker compose -f {compose} ps
+for _ in $(seq 1 30); do
+  if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx {name}; then break; fi
+  sleep 2
+done
+"""
+
+PORTAINER_SERVER_SERVICES = """  portainer:
+    image: portainer/portainer-ce:{version}
+    container_name: portainer
+    restart: unless-stopped
+    # UI — только localhost, наружу его отдаёт Caddy. Туннель edge-агентов
+    # (websocket) слушает {tunnel} ВНУТРИ контейнера и публикуется на
+    # 127.0.0.1:{tunnel_local}: наружу его выводит Caddy (websocket на :80
+    # того же домена), потому что у провайдера закрыты все порты >1024,
+    # а агент умеет только ws://.
+    ports:
+      - "127.0.0.1:{port}:{port}"
+      - "127.0.0.1:{tunnel_local}:{tunnel}"
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro{admin_mount}
+{admin_args}"""
+
+PORTAINER_AGENT_SERVICES = """  portainer-agent:
+    image: portainer/agent:{version}
+    container_name: portainer-agent
+    restart: unless-stopped
+    # edge-режим: адрес сервера, порт туннеля и отпечаток chisel зашиты в
+    # EDGE_KEY, поэтому ни AGENT_CLUSTER_ADDR, ни join token не нужны. Наружу
+    # ничего не публикуем: Docker-сокет узла видно только через туннель.
+    environment:
+      EDGE: "true"
+      EDGE_INSECURE_POLL: "true"
+      EDGE_ID: "{edge_id}"
+      EDGE_KEY: "{edge_key}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+networks:
+  default:
+    name: portainer_edge
+"""
+
+PORTAINER_VERIFY = r"""
+if $SUDO docker ps --format '{{{{.Names}}}}' | grep -qx {name}; then
+  echo "  OK: {name} -> $($SUDO docker ps --filter name=^/{name}$ --format '{{{{.Status}}}}')"
+else
+  echo "  MISSING: {name}"
+fi
+{extra}"""
+
 
 def _codename(cfg: Config, host: RemoteHost) -> str:
     """Определяет VERSION_CODENAME на удалённом хосте через /etc/os-release."""
@@ -1376,13 +1789,107 @@ def _validate_portal_auth(cfg: Config) -> None:
         )
 
 
+def _validate_portainer_agent(cfg: Config) -> None:
+    """Данные окружения edge-агента: EDGE_ID + EDGE_KEY идят вместе.
+
+    Адрес сервера, порт туннеля и отпечаток chisel лежат внутри
+    EDGE_KEY, поэтому portainer_domain агенту не нужен. Но если он
+    задан, он должен совпадать с ключом: иначе агент молча уйдёт в
+    чужой Portainer (типично — скопировали ключ от другого окружения).
+    """
+    if cfg.portainer and cfg.portainer_mode == "agent":
+        # адрес сервера, порт туннеля и отпечаток chisel лежат внутри EDGE_KEY,
+        # поэтому portainer_domain агенту больше не нужен — но если он задан,
+        # он должен совпадать с тем, что в ключе: иначе агент молча уйдёт
+        # в чужой Portainer (типично — скопировали ключ от другого окружения)
+        if bool(cfg.portainer_agent_edge_id) != bool(cfg.portainer_agent_edge_key):
+            missing = "portainer_agent_edge_id" if not cfg.portainer_agent_edge_id else (
+                "portainer_agent_edge_key"
+            )
+            raise ValueError(
+                f"portainer_mode=agent: не задано {missing}; нужны оба значения "
+                "сразу (UI Portainer -> Environments -> окружение -> "
+                "Edge agent standard)"
+            )
+        if cfg.portainer_agent_edge_id and not _UUID_RE.match(cfg.portainer_agent_edge_id):
+            raise ValueError(
+                f"portainer_agent_edge_id должен быть UUID, получено "
+                f"{cfg.portainer_agent_edge_id!r}"
+            )
+        if cfg.portainer_agent_edge_key:
+            parts = _portainer_edge_key_parts(cfg.portainer_agent_edge_key)
+            if not parts:
+                raise ValueError(
+                    "portainer_agent_edge_key не похож на EdgeKey Portainer "
+                    "(base64, внутри адрес сервера|хост:порт|отпечаток|id); "
+                    "скопируйте значение целиком из UI Portainer"
+                )
+            if cfg.portainer_domain and _HOSTNAME_RE.match(cfg.portainer_domain):
+                key_domain = parts[0].split("://", 1)[-1].rstrip("/")
+                if key_domain != cfg.portainer_domain:
+                    raise ValueError(
+                        f"portainer_agent_edge_key ссылается на {parts[0]}, а в "
+                        f"конфиге portainer_domain={cfg.portainer_domain!r}: агент "
+                        "будет опрашивать чужой Portainer. Оставьте пустым "
+                        "portainer_domain или возьмите ключ своего окружения"
+                    )
+
+
+def _validate_modes(cfg: Config) -> None:
+    """Проверки режимов Beszel/Portainer и их доменов.
+
+    Ошибки режима ловятся до похода в SSH: иначе хост остался бы с лишним
+    контейнером или с недоступным UI.
+    """
+    if cfg.beszel and cfg.beszel_mode not in ("hub", "agent"):
+        raise ValueError(
+            f"Неизвестный beszel_mode: {cfg.beszel_mode!r}; доступны: hub, agent"
+        )
+    if cfg.portainer and cfg.portainer_mode == "agent":
+        _validate_portainer_agent(cfg)
+    if cfg.portainer and cfg.portainer_mode not in ("server", "agent"):
+        raise ValueError(
+            f"Неизвестный portainer_mode: {cfg.portainer_mode!r}; "
+            "доступны: server, agent"
+        )
+    if cfg.portainer and cfg.portainer_mode == "server":
+        if not cfg.portainer_domain:
+            raise ValueError(
+                "portainer требует portainer_domain: UI Portainer не работает под "
+                "базовым путём портала, нужен отдельный домен "
+                "(например portainer.example.com)"
+            )
+        if not _HOSTNAME_RE.match(cfg.portainer_domain):
+            raise ValueError(f"Некорректный portainer_domain: {cfg.portainer_domain!r}")
+        if not cfg.caddy:
+            raise ValueError(
+                "portainer требует caddy: UI слушает только 127.0.0.1, наружу его "
+                "отдаёт Caddy (--caddy вместе с --portainer-domain)"
+            )
+    for cidr in cfg.beszel_agent_allow:
+        if not _CIDR_RE.match(cidr):
+            raise ValueError(
+                f"Некорректный beszel_agent_allow: {cidr!r}; нужен адрес или CIDR, "
+                "например 185.50.202.219/32"
+            )
+    if cfg.beszel_hub_url:
+        _beszel_hub_base(cfg)
+    if not _SEMVER_RE.match(cfg.beszel_version):
+        raise ValueError(
+            f"Некорректный beszel_version: {cfg.beszel_version!r}; нужен тег вида "
+            "0.20.0 (образы henrygd/beszel и henrygd/beszel-agent; «latest» "
+            "недопустим — версии hub и agent должны совпадать)"
+        )
+
+
 def _validate(cfg: Config) -> list[Tile]:
     """Проверки, которые обязаны случиться до отправки скрипта на хост.
 
     Ошибка в конфиге (домен, upstream, путь плитки) не должна оставлять хост
     наполовину настроенным, поэтому всё это проверяется на стороне Python.
     """
-    if cfg.beszel and cfg.caddy and cfg.caddy_portal:
+    _validate_modes(cfg)
+    if cfg.beszel and cfg.caddy and cfg.caddy_portal and cfg.beszel_mode == "hub":
         path = _beszel_path(cfg)
         if not _PORTAL_PATH_RE.match(path):
             raise ValueError(f"Некорректный beszel_path: {cfg.beszel_path!r}")
@@ -1566,8 +2073,55 @@ def _dozzle_verify_script(cfg: Config) -> str:
     )
 
 
+def _beszel_allow_scripts(cfg: Config) -> tuple[str, str]:
+    """(правила ufw, итоговая строка) для порта агента.
+
+    Правила добавляются только если ufw активен: на голом Ubuntu он есть, но
+    выключен, и `ufw allow` молча ничего не сделает — поэтому в этом случае
+    печатаем предупреждение с портом, который должен быть открыт наружу.
+    """
+    port = cfg.beszel_agent_port
+    if not cfg.beszel_agent_allow:
+        return "", ""
+    allow = ", ".join(cfg.beszel_agent_allow)
+    rules = "".join(
+        f'  ufw allow from {cidr} to any port {port} proto tcp '
+        f"comment 'beszel hub {port}' >/dev/null\n"
+        for cidr in cfg.beszel_agent_allow
+    )
+    block = BESZEL_AGENT_ALLOW.format(
+        port=port,
+        allow=allow,
+        ufw_rules=rules,
+    )
+    note = BESZEL_AGENT_ALLOW_NOTE.format(port=port, allow=allow)
+    return block, note
+
+
+def _beszel_verify_script(cfg: Config) -> str:
+    """Проверка Beszel: хаб (режим hub) либо агент и его порт (режим agent)."""
+    outbound = cfg.beszel_mode == "agent" and bool(_beszel_hub_base(cfg))
+    return BESZEL_VERIFY.format(
+        hub_check="" if cfg.beszel_mode == "agent" else BESZEL_HUB_CHECK,
+        port_check=(
+            BESZEL_AGENT_PORT_CHECK.format(
+                port=cfg.beszel_agent_port,
+                fail=(
+                    f"агент не слушает {cfg.beszel_agent_port} (не критично: "
+                    "соединение инициирует агент через HUB_URL)"
+                    if outbound
+                    else f"ПРОБЛЕМА: никто не слушает {cfg.beszel_agent_port} — "
+                    "хаб не достучится до агента"
+                ),
+            )
+            if cfg.beszel_mode == "agent"
+            else ""
+        ),
+    )
+
+
 def _beszel_script(cfg: Config) -> str:
-    """Фрагмент установки Beszel Hub+Agent: compose, проверка, валидация ключей."""
+    """Фрагмент установки Beszel: compose, проверка, валидация ключей."""
     for label, value in (
         ("beszel_agent_key", cfg.beszel_agent_key),
         ("beszel_agent_token", cfg.beszel_agent_token),
@@ -1588,21 +2142,259 @@ def _beszel_script(cfg: Config) -> str:
     key_read, key_fix = _beszel_key_keep(
         BESZEL_COMPOSE, cfg.beszel_agent_key, cfg.beszel_agent_token
     )
+    keys = {
+        "port": cfg.beszel_port,
+        "dir": BESZEL_DIR,
+        "compose": BESZEL_COMPOSE,
+        "beszel_version": cfg.beszel_version,
+        "key_read": key_read,
+        "key_fix": key_fix,
+        "key": cfg.beszel_agent_key or "__BESZEL_KEY_KEEP__",
+        "token": cfg.beszel_agent_token or "__BESZEL_TOKEN_KEEP__",
+    }
+    if cfg.beszel_mode == "agent":
+        hub_base = _beszel_hub_base(cfg)
+        if hub_base:
+            # Исходящий режим: хаб сам к агенту не ходит, firewall не нужен
+            allow, allow_note = "", ""
+            hub_env = f'\n      HUB_URL: "{hub_base}"'
+            mode_note = f'echo "  агент сам подключается к хабу {hub_base} (HUB_URL)"'
+        else:
+            allow, allow_note = _beszel_allow_scripts(cfg)
+            hub_env = ""
+            mode_note = (
+                f'echo "  агент слушает порт {cfg.beszel_agent_port}; '
+                'хаб ходит к нему по этому порту"'
+            )
+        return BESZEL_AGENT_STACK.format(
+            agent_port=cfg.beszel_agent_port,
+            hub_env=hub_env,
+            mode_note=mode_note,
+            allow=allow,
+            allow_note=allow_note,
+            **keys,
+        ) + _beszel_verify_script(cfg)
     return BESZEL_STACK.format(
-        port=cfg.beszel_port,
-        dir=BESZEL_DIR,
-        compose=BESZEL_COMPOSE,
-        key_read=key_read,
-        key_fix=key_fix,
         app_url=_yaml_str(public_url),
         public_url=public_url,
         auth_env=_beszel_auth_env(cfg),
         auth_warning=_beszel_auth_warning(cfg),
-        key=cfg.beszel_agent_key or "__BESZEL_KEY_KEEP__",
-        key_quoted=_sh_quote(cfg.beszel_agent_key),
-        token=cfg.beszel_agent_token or "__BESZEL_TOKEN_KEEP__",
-        token_quoted=_sh_quote(cfg.beszel_agent_token),
-    ) + BESZEL_VERIFY
+        **keys,
+    ) + _beszel_verify_script(cfg)
+
+
+def _portainer_edge_key_parts(edge_key: str) -> list[str] | None:
+    """Разбор EDGE_KEY Portainer: url|host:port|fingerprint|endpoint_id.
+
+    Ключ выдаёт сервер при создании окружения, и агент берёт из него всё —
+    адрес для опроса, порт туннеля и отпечаток chisel. Если ключ битый,
+    агент молча не зарегистрируется, поэтому разбираем его заранее.
+    """
+    if not edge_key:
+        return None
+    try:
+        raw = base64.b64decode(edge_key + "=" * (-len(edge_key) % 4), validate=True)
+        parts = raw.decode("utf-8").split("|")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return parts if len(parts) == _PORT_EDGE_KEY_FIELDS else None
+
+
+def _portainer_edge_tunnel(edge_key: str) -> str:
+    """Человекочитаемый адрес туннеля из EDGE_KEY — для сообщений установки."""
+    parts = _portainer_edge_key_parts(edge_key)
+    if not parts:
+        return "EDGE_KEY не задан, адрес туннеля берётся из прежнего compose"
+    return f"ws://{parts[1]} (EDGE_KEY окружения {parts[3]})"
+
+
+def _portainer_edge_keep(compose: str, edge_id: str, edge_key: str) -> tuple[str, str]:
+    """(чтение, подстановка) EDGE_ID/EDGE_KEY из прежнего compose.
+
+    Данные окружения Portainer выдаёт UI только при создании, поэтому пустые
+    значения в конфиге не должны затирать уже работающий агент — как и ключи
+    Beszel.
+    """
+    if edge_id and edge_key:
+        return "", ""
+    read = (
+        f"if [ -f {compose} ]; then\n"
+        "  PORTAINER_OLD_EDGE_ID=\"$(sed -n 's/^      EDGE_ID: \"\\(.*\\)\"$/\\1/p' "
+        f"{compose} | head -1)\"\n"
+        "  PORTAINER_OLD_EDGE_KEY=\"$(sed -n 's/^      EDGE_KEY: \"\\(.*\\)\"$/\\1/p' "
+        f"{compose} | head -1)\"\n"
+        "else\n"
+        '  PORTAINER_OLD_EDGE_ID=""\n'
+        '  PORTAINER_OLD_EDGE_KEY=""\n'
+        "fi\n"
+    )
+    fix = (
+        'if [ -n "$PORTAINER_OLD_EDGE_ID" ] && [ -n "$PORTAINER_OLD_EDGE_KEY" ]; then\n'
+        '  $SUDO sed -i "s|__PORTAINER_EDGE_ID_KEEP__|${PORTAINER_OLD_EDGE_ID}|" '
+        f"{compose}\n"
+        '  $SUDO sed -i "s|__PORTAINER_EDGE_KEY_KEEP__|${PORTAINER_OLD_EDGE_KEY}|" '
+        f"{compose}\n"
+        "  echo \"  EDGE_ID/EDGE_KEY: оставлены прежние (в конфиге не заданы)\"\n"
+        "else\n"
+        '  $SUDO sed -i "s|__PORTAINER_EDGE_ID_KEEP__||" ' + compose + "\n"
+        '  $SUDO sed -i "s|__PORTAINER_EDGE_KEY_KEEP__||" ' + compose + "\n"
+        "fi\n"
+    )
+    return read, fix
+
+
+def _portainer_extra_verify(cfg: Config) -> str:
+    """Проверки сервера Portainer: UI, туннель и файл пароля админа.
+
+    Используется и при установке, и в verify(): иначе `--verify-only` молчал
+    бы про не отвечающий UI и пустой токен агента.
+    """
+    return (
+        "CODE=\"$($SUDO curl -sk -o /dev/null -w '%{http_code}' "
+        f"https://127.0.0.1:{cfg.portainer_port}/api/status 2>/dev/null || true)\"\n"
+        '[ -n "$CODE" ] || CODE=000\n'
+        'if [ "$CODE" = "200" ]; then\n'
+        f'  echo "  OK: UI отвечает на 127.0.0.1:{cfg.portainer_port}/api/status"\n'
+        "else\n"
+        f'  echo "  ПРОБЛЕМА: UI не отвечает (код $CODE)"\n'
+        "fi\n"
+        f"if $SUDO ss -ltn 'sport = :{cfg.portainer_tunnel_local_port}' | grep -q LISTEN; then\n"
+        f'  echo "  OK: туннель edge-агентов слушает 127.0.0.1:'
+        f'{cfg.portainer_tunnel_local_port}"\n'
+        "else\n"
+        f'  echo "  ПРОБЛЕМА: порт {cfg.portainer_tunnel_local_port} не слушается'
+        ' — агенты узлов не подключатся"\n'
+        "fi\n"
+        # агент идёт на <домен>:<portainer_tunnel_port> по ws://, поэтому важно
+        # не только то, что chisel слушает, но и что путь через Caddy живой.
+        # --resolve к 127.0.0.1: проверка идёт с самого хоста и не зависит от
+        # того, заходит ли hairpin-NAT на внешний адрес.
+        # весь curl — одной строкой: внутри $(...) перевод строки разделяет
+        # команды, и curl получает только первую часть флагов без URL
+        f'PORT_TUNNEL_CODE="$($SUDO curl -s -m 8 -o /dev/null -w \'%{{http_code}}\''
+        f' --resolve {cfg.portainer_domain}:80:127.0.0.1'
+        ' -H \'Connection: Upgrade\' -H \'Upgrade: websocket\''
+        ' -H \'Sec-WebSocket-Version: 13\''
+        ' -H \'Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\''
+        f' http://{cfg.portainer_domain}/ 2>/dev/null || true)"\n'
+        '[ -n "$PORT_TUNNEL_CODE" ] || PORT_TUNNEL_CODE=000\n'
+        'if [ "$PORT_TUNNEL_CODE" != "000" ]; then\n'
+        f'  echo "  OK: туннель отвечает через Caddy на ws://{cfg.portainer_domain}'
+        f':{cfg.portainer_tunnel_port} (код $PORT_TUNNEL_CODE)"\n'
+        "else\n"
+        f'  echo "  ПРОБЛЕМА: на ws://{cfg.portainer_domain}:'
+        f'{cfg.portainer_tunnel_port} никто не отвечает — проверьте, что Caddy"\n'
+        "  echo \"    слушает :80 и в portainer-tunnel.caddy есть reverse_proxy\"\n"
+        "fi\n"
+        'unset PORT_TUNNEL_CODE\n'
+        # начальный админ: пароль лежит отдельным файлом 0600 и не попадает
+        # ни в compose, ни в docker inspect (там виден только путь к файлу)
+        f"if [ -f {PORTAINER_ADMIN_FILE} ]; then\n"
+        f"  MODE=\"$($SUDO stat -c %a {PORTAINER_ADMIN_FILE})\"\n"
+        f'  echo "  OK: файл начального пароля {PORTAINER_ADMIN_FILE} (права $MODE)"\n'
+        '  [ "$MODE" = "600" ] || echo "  ВНИМАНИЕ: права $MODE — файл читают все"\n'
+        "else\n"
+        f'  echo "  ПРОБЛЕМА: нет {PORTAINER_ADMIN_FILE} — админ не создан."\n'
+        '  echo "    Портал даёт 5 секунд на создание admin в UI, потом он исчезает."\n'
+        '  echo "    Перепрогоните с --portainer-admin-password."\n'
+        "fi\n"
+    ) + (
+        ""
+        if cfg.portainer_admin_password
+        else '  echo "  ВНИМАНИЕ: portainer_admin_password не задан.\n'
+        '    После первого старта у Portainer есть 5 секунд, чтобы создать\n'
+        '    admin в UI, иначе портал больше не предложит этого."\n'
+    )
+
+
+def _portainer_script(cfg: Config) -> str:
+    """Фрагмент установки Portainer CE: сервер с UI либо edge-агент узла."""
+    edge_id, edge_key = cfg.portainer_agent_edge_id, cfg.portainer_agent_edge_key
+    for name, value in (("portainer_agent_edge_id", edge_id), ("portainer_agent_edge_key", edge_key)):
+        if any(ch in value for ch in '"\n\r'):
+            raise ValueError(
+                f"{name} содержит недопустимые символы "
+                '(кавычки или перевод строки); скопируйте значение целиком из UI Portainer'
+            )
+    edge_read, edge_fix = _portainer_edge_keep(PORTAINER_COMPOSE, edge_id, edge_key)
+    admin_write = ""
+    if cfg.portainer_admin_password:
+        if any(ch in cfg.portainer_admin_password for ch in '"\n\r'):
+            raise ValueError(
+                "portainer_admin_password содержит недопустимые символы "
+                '(кавычки или перевод строки)'
+            )
+        # mktemp даёт файл 0600 ещё до записи, install — права 0600 и владельца
+        # root на хосте: пароль не должен быть виден ни в ps, ни в compose
+        admin_write = (
+            'PT_ADMIN_PW="$(mktemp)"\n'
+            f"printf '%s' {_sh_quote(cfg.portainer_admin_password)} > \"$PT_ADMIN_PW\"\n"
+            "$SUDO install -m 0600 -o root -g root \"$PT_ADMIN_PW\" "
+            f'{PORTAINER_ADMIN_FILE}\n'
+            'rm -f "$PT_ADMIN_PW"\n'
+            'unset PT_ADMIN_PW\n'
+        )
+    if cfg.portainer_mode == "agent":
+        services = PORTAINER_AGENT_SERVICES.format(
+            version=cfg.portainer_version,
+            edge_id=edge_id or "__PORTAINER_EDGE_ID_KEEP__",
+            edge_key=edge_key or "__PORTAINER_EDGE_KEY_KEEP__",
+        )
+        name = "portainer-agent"
+        mode = "edge agent"
+        # пустые ключи не затирают прежние (см. _portainer_edge_keep), но на
+        # новом узле агент без них не зарегистрируется — говорим об этом
+        extra = (
+            f'if $SUDO grep -q \'EDGE_KEY: ""\' {PORTAINER_COMPOSE}; then\n'
+            '  echo "  ПРОБЛЕМА: EDGE_KEY пуст — агент не зарегистрируется в хабе."\n'
+            '  echo "    UI Portainer -> Environments -> нужное окружение ->"\n'
+            '  echo "    Edge agent standard: скопируйте EDGE_ID и EDGE_KEY, затем"\n'
+            "    echo \"    перепрогоните с --portainer-agent-edge-id/"
+            "edge-key.\"\n"
+            "else\n"
+            '  echo "  OK: EDGE_ID/EDGE_KEY заданы в compose"\n'
+            "fi\n"
+            f'  echo "  туннель: {_portainer_edge_tunnel(edge_key)}'
+            '"\n'
+        )
+    else:
+        admin_mount = f"\n      - ./admin-password:{PORTAINER_ADMIN_SECRET}:ro"
+        # образ уже запускает сам portainer: в command идёт ТОЛЬКО список
+        # флагов, иначе он получает "portainer portainer ..." и падает
+        cmd_flags = [
+            # 0.0.0.0 внутри контейнера обязателен: иначе chisel слушает только
+            # localhost контейнера и publish не доходит до туннеля
+            "--tunnel-addr=0.0.0.0",
+            f"--tunnel-port={cfg.portainer_tunnel_port}",
+        ]
+        if cfg.portainer_admin_password:
+            cmd_flags.insert(0, f"--admin-password-file {PORTAINER_ADMIN_SECRET}")
+        else:
+            # без пароля файл не создаётся — ссылаться на него в compose нельзя,
+            # контейнер не стартует
+            admin_mount = ""
+        admin_args = "    command: " + " ".join(cmd_flags) + "\n"
+        services = PORTAINER_SERVER_SERVICES.format(
+            version=cfg.portainer_version,
+            port=cfg.portainer_port,
+            tunnel=cfg.portainer_tunnel_port,
+            tunnel_local=cfg.portainer_tunnel_local_port,
+            admin_mount=admin_mount,
+            admin_args=admin_args,
+        )
+        name = "portainer"
+        mode = "server"
+        extra = _portainer_extra_verify(cfg)
+    return PORTAINER_STACK.format(
+        mode=mode,
+        dir=PORTAINER_DIR,
+        compose=PORTAINER_COMPOSE,
+        services=services,
+        admin_write=admin_write,
+        token_read=edge_read,
+        token_fix=edge_fix,
+        name=name,
+    ) + PORTAINER_VERIFY.format(name=name, extra=extra)
 
 
 def install(cfg: Config, host: RemoteHost) -> None:
@@ -1649,12 +2441,15 @@ def install(cfg: Config, host: RemoteHost) -> None:
         )
     if cfg.beszel:
         script += _beszel_script(cfg)
+    if cfg.portainer:
+        script += _portainer_script(cfg)
     if cfg.dozzle:
         script += _dozzle_script(cfg)
     if cfg.caddy:
         sites = _caddy_sites_script(cfg, portal=bool(cfg.caddy_portal))
         if cfg.caddy_portal:
             sites += _portal_script(cfg, tiles)
+        roots = _static_roots(cfg)
         script += CADDY.format(
             dir=CADDY_DIR,
             compose=CADDY_COMPOSE,
@@ -1662,7 +2457,10 @@ def install(cfg: Config, host: RemoteHost) -> None:
             portal_dir=PORTAL_DIR,
             email=cfg.caddy_email,
             caddyfile=_caddy_caddyfile(cfg.caddy_email),
+            portal_cleanup=_portal_cleanup_script() if cfg.caddy_portal else "",
             sites=sites,
+            static_volumes=_static_volumes(roots),
+            static_check=_static_roots_check(roots),
         )
         script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR)
         if cfg.caddy_portal:
@@ -1677,7 +2475,12 @@ def verify(cfg: Config, host: RemoteHost) -> None:
     tiles = _validate(cfg)
     script = _bootstrap(cfg.sudo)
     if cfg.beszel:
-        script += BESZEL_VERIFY
+        script += _beszel_verify_script(cfg)
+    if cfg.portainer:
+        script += PORTAINER_VERIFY.format(
+            name="portainer" if cfg.portainer_mode == "server" else "portainer-agent",
+            extra=_portainer_extra_verify(cfg) if cfg.portainer_mode == "server" else "",
+        )
     if cfg.dozzle:
         script += _dozzle_verify_script(cfg)
     if cfg.caddy:

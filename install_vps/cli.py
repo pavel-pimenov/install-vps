@@ -9,6 +9,37 @@ from .installer import EXTRA_TOOLS, install, verify
 from .ssh import RemoteHost
 
 
+def _add_beszel_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--beszel", action="store_true",
+                   help="поднять Beszel: хаб+агент (--beszel-mode hub) "
+                        "либо только агент для удалённого хаба (--beszel-mode agent)")
+    p.add_argument("--beszel-mode", choices=("hub", "agent"),
+                   help="что ставить: hub — хаб с локальным агентом (по умолчанию), "
+                        "agent — только агент, к которому ходит хаб с другого сервера")
+    p.add_argument("--beszel-agent-allow", metavar="CIDR", action="append",
+                   help="кому открыть порт агента (45876) в режиме agent, "
+                        "например --beszel-agent-allow 185.50.202.219/32 "
+                        "(можно указать несколько раз)")
+    p.add_argument("--beszel-port", type=int, help="порт Beszel Hub (по умолчанию 8090)")
+    p.add_argument("--beszel-version", metavar="X.Y.Z",
+                   help="версия образов henrygd/beszel и henrygd/beszel-agent "
+                        "(по умолчанию 0.20.0); hub и agent должны совпадать")
+    p.add_argument("--beszel-key",
+                   help="публичный ключ агента Beszel (из веб-UI Hub: Add system)")
+    p.add_argument("--beszel-token",
+                   help="токен агента Beszel (из того же диалога Add system)")
+    p.add_argument("--beszel-hub-url", metavar="URL",
+                   help="агент сам звонит в хаб по этому URL (https://<домен> "
+                        "при хабе под Caddy); нужно, когда провайдер узла режет входящие порты")
+    p.add_argument("--beszel-user-creation", action="store_true",
+                   help="разрешить регистрацию новых пользователей (нужно для OAuth)")
+    p.add_argument("--beszel-disable-password-auth", action="store_true",
+                   help="вход только через OAuth, пароль отключить "
+                        "(включайте лишь после проверки, что OAuth работает — иначе логин потерян)")
+    p.add_argument("--beszel-path", metavar="PATH",
+                   help="путь плитки Beszel на портале (по умолчанию /monitor)")
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="install-vps",
@@ -38,20 +69,7 @@ def _parser() -> argparse.ArgumentParser:
                         "или official (docker-ce с download.docker.com)")
     p.add_argument("--verify-only", action="store_true",
                    help="только проверить наличие пакетов, ничего не ставить")
-    p.add_argument("--beszel", action="store_true",
-                   help="поднять Beszel Hub+Agent одним docker compose (порт 8090)")
-    p.add_argument("--beszel-port", type=int, help="порт Beszel Hub (по умолчанию 8090)")
-    p.add_argument("--beszel-key",
-                   help="публичный ключ агента Beszel (из веб-UI Hub: Add system)")
-    p.add_argument("--beszel-token",
-                   help="токен агента Beszel (из того же диалога Add system)")
-    p.add_argument("--beszel-user-creation", action="store_true",
-                   help="разрешить регистрацию новых пользователей (нужно для OAuth)")
-    p.add_argument("--beszel-disable-password-auth", action="store_true",
-                   help="вход только через OAuth, пароль отключить "
-                        "(включайте лишь после проверки, что OAuth работает — иначе логин потерян)")
-    p.add_argument("--beszel-path", metavar="PATH",
-                   help="путь плитки Beszel на портале (по умолчанию /monitor)")
+    _add_beszel_args(p)
     p.add_argument("--dozzle", action="store_true",
                    help="логи контейнеров в браузере (Dozzle) под путём портала, "
                         "с входом по паролю; требует --caddy-portal")
@@ -79,6 +97,35 @@ def _parser() -> argparse.ArgumentParser:
                    help="e-mail для Let's Encrypt (уведомления об истечении сертификата)")
     p.add_argument("--caddy-domain", metavar="DOMAIN",
                    help="домен для Beszel Hub, напр. monitor.example.com")
+    p.add_argument("--portainer", action="store_true",
+                   help="поставить Portainer CE: сервер с UI (--portainer-mode server) "
+                        "либо edge-агент узла (--portainer-mode agent)")
+    p.add_argument("--portainer-mode", choices=("server", "agent"),
+                   help="что ставить: server — UI и туннель (по умолчанию), "
+                        "agent — edge-агент, который сам ходит на сервер")
+    p.add_argument("--portainer-domain", metavar="DOMAIN",
+                   help="домен для UI Portainer, напр. portainer.example.com "
+                        "(для mode=server обязателен: под путём портала Portainer "
+                        "не работает)")
+    p.add_argument("--portainer-version", metavar="ВЕРСИЯ",
+                   help="версия образов portainer-ce и portainer/agent "
+                        "(по умолчанию 2.45.1; сервер и агенты должны совпадать)")
+    p.add_argument("--portainer-admin-password", metavar="ПАРОЛЬ",
+                   help="пароль первого администратора Portainer: окно создания "
+                        "admin в UI длится 5 секунд, потом портал его больше не "
+                        "предложит. Пароль пишется на хосте файлом 0600 и не "
+                        "светится в compose")
+    p.add_argument("--portainer-tunnel-port", metavar="ПОРТ", type=int,
+                   help="порт туннеля edge-агентов ВНУТРИ контейнера сервера: "
+                        "именно он попадает в EDGE_KEY и по нему агент идёт на "
+                        "<домен>:<порт> (по умолчанию 80 — единственный вариант, "
+                        "который проксирует Caddy; агент умеет только ws://)")
+    p.add_argument("--portainer-agent-edge-id", metavar="UUID",
+                   help="EDGE_ID окружения из UI Portainer (Environments -> "
+                        "окружение -> Edge agent standard); нужен для mode=agent")
+    p.add_argument("--portainer-agent-edge-key", metavar="BASE64",
+                   help="EDGE_KEY того же окружения; вместе с EDGE_ID "
+                        "достаточен для mode=agent, домен задавать не нужно")
     p.add_argument("--caddy-site", metavar="DOMAIN=UPSTREAM", action="append",
                    help="любой сайт: monitor.example.com=http://127.0.0.1:8080 "
                         "(можно указать несколько раз)")

@@ -32,10 +32,19 @@ class Config:
     tools: list[str] = field(default_factory=list)  # утилиты вне репозиториев Ubuntu
     swap_size_mb: int = 512
     docker_source: str = "ubuntu"   # "ubuntu" — docker.io из архивов Ubuntu; "official" — docker-ce
-    beszel: bool = False            # поднять Beszel Hub+Agent одним docker-compose (порт 8090)
-    beszel_port: int = 8090
+    beszel: bool = False            # поднять Beszel: хаб+агент (hub) либо только агент (agent)
+    beszel_mode: str = "hub"        # "hub" — хаб и локальный агент, "agent" — только агент
+    # для удалённого хаба: агент сам слушает порт, хаб ходит к нему
+    beszel_port: int = 8090         # порт хаба (режим hub)
+    beszel_agent_port: int = 45876  # порт агента (режим agent)
+    beszel_version: str = "0.20.0"  # тег образа henrygd/beszel(-agent)
+    beszel_agent_allow: list[str] = field(default_factory=list)  # CIDR хабов, кому открыт порт агента
     beszel_agent_key: str = ""      # публичный ключ агента (веб-UI Hub: Add system)
     beszel_agent_token: str = ""    # токен агента из того же диалога (обязателен в 0.20+)
+    # Агент сам звонит в хаб по этому URL — нужен, когда провайдер узла режет
+    # входящие порты: по умолчанию хаб сам ходит к агенту (LISTEN), а с
+    # HUB_URL соединение инициирует агент. Для хаба под Caddy — https://<домен>.
+    beszel_hub_url: str = ""
     beszel_user_creation: bool = False  # разрешить самостоятельную регистрацию (для OAuth)
     beszel_disable_password_auth: bool = False  # вход только через OAuth (ломает пароль!)
     zram_size_mb: int = 0          # размер zram-свопа в МБ (0 — выключить; докерится пакетом)
@@ -44,7 +53,31 @@ class Config:
     docker_log_max_file: str = "3"    # сколько файлов лога хранить на контейнер
     caddy: bool = False            # обратный прокси с автоматическим HTTPS (80/443)
     caddy_email: str = ""          # e-mail для Let's Encrypt (уведомления об истечении)
+    # access-лог Caddy в stdout контейнера (docker logs caddy): без него
+    # не видно, какие запросы и с какими кодами доходят до сервиса, — а это
+    # первое, что нужно, когда плитка «не открывается»
+    caddy_access_log: bool = True
     caddy_domain: str = ""         # домен для Beszel Hub (нужен caddy + beszel)
+    # Portainer CE: на центральном хосте — сервер с UI, на узлах — edge agent
+    # (сам ходит на сервер, входящие порты открывать не нужно)
+    portainer: bool = False
+    portainer_mode: str = "server"  # "server" — UI, "agent" — edge-агент узла
+    portainer_version: str = "2.45.1"  # версия образов portainer-ce и agent
+    portainer_port: int = 9443      # UI-порт, слушает только 127.0.0.1 (наружу — Caddy)
+    # Туннель edge-агентов. Агент умеет только ws:// и стучится на
+    # <домен>:<portainer_tunnel_port> — это порт ВНУТРИ контейнера, он же
+    # попадает в EdgeKey. Наружу он публикуется на 127.0.0.1:tunnel_local,
+    # а в мир его отдаёт Caddy (websocket на :80 того же домена): у провайдера
+    # закрыт весь порт >1024, поэтому публиковать туннель напрямую бессмысленно.
+    portainer_tunnel_port: int = 80
+    portainer_tunnel_local_port: int = 8000
+    portainer_domain: str = ""      # домен для UI Portainer (у Portainer свой сертификат)
+    # Данные окружения из UI Portainer (Environments -> нужное -> Edge agent
+    # standard): EDGE_ID — UUID, EDGE_KEY — base64, внутри адрес сервера,
+    # порт туннеля и отпечаток chisel. Оба нужны вместе.
+    portainer_agent_edge_id: str = ""
+    portainer_agent_edge_key: str = ""
+    portainer_admin_password: str = ""  # пароль первого admin (5-секундное окно UI)
     caddy_sites: list[str] = field(default_factory=list)  # "домен=http://upstream"
     caddy_portal: str = ""         # домен страницы с плитками сервисов
     caddy_portal_title: str = "Сервисы"  # заголовок страницы плиток
@@ -86,9 +119,13 @@ _OVERRIDES = (
     ("swap_size_mb", "swap_size_mb"),
     ("docker_source", "docker_source"),
     ("beszel", "beszel"),
+    ("beszel_mode", "beszel_mode"),
+    ("beszel_agent_allow", "beszel_agent_allow"),
     ("beszel_port", "beszel_port"),
+    ("beszel_version", "beszel_version"),
     ("beszel_agent_key", "beszel_key"),
     ("beszel_agent_token", "beszel_token"),
+    ("beszel_hub_url", "beszel_hub_url"),
     ("beszel_user_creation", "beszel_user_creation"),
     ("beszel_disable_password_auth", "beszel_disable_password_auth"),
     ("beszel_path", "beszel_path"),
@@ -104,6 +141,14 @@ _OVERRIDES = (
     ("caddy", "caddy"),
     ("caddy_email", "caddy_email"),
     ("caddy_domain", "caddy_domain"),
+    ("portainer", "portainer"),
+    ("portainer_mode", "portainer_mode"),
+    ("portainer_version", "portainer_version"),
+    ("portainer_domain", "portainer_domain"),
+    ("portainer_tunnel_port", "portainer_tunnel_port"),
+    ("portainer_agent_edge_id", "portainer_agent_edge_id"),
+    ("portainer_agent_edge_key", "portainer_agent_edge_key"),
+    ("portainer_admin_password", "portainer_admin_password"),
     ("caddy_sites", "caddy_site"),
     ("caddy_portal", "caddy_portal"),
     ("caddy_portal_title", "caddy_portal_title"),

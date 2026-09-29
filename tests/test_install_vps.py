@@ -485,6 +485,597 @@ class PortalAuthTests(unittest.TestCase):
         self.assertEqual(cfg.portal_password, "test-portal-pass-42")
 
 
+class PortalAssetTests(unittest.TestCase):
+    """Крупные бандлы SPA отдаются без буферизации."""
+
+    def test_beszel_tile_flushes_big_bundle(self) -> None:
+        cfg = full_config()
+        block = _portal_caddy_block(cfg, _tiles(cfg))
+        # без flush_interval бандл Hub (490 КБ) уходит одним куском, и на
+        # канале с буксующим TCP-окном браузер рвёт загрузку: страница белая
+        self.assertIn("\thandle_path /monitor/* {\n\t\treverse_proxy 127.0.0.1:8090 {\n"
+                      "\t\t\tflush_interval -1", block)
+        # свой Cache-Control не добавляем: приложения ставят его сами, иначе
+        # в ответе будет два заголовка
+        self.assertNotIn("Cache-Control", block)
+
+    def test_dozzle_tile_keeps_streaming(self) -> None:
+        cfg = full_config(dozzle=True)
+        block = _portal_caddy_block(cfg, _tiles(cfg))
+        self.assertIn("\thandle /logs/* {", block)
+        self.assertIn("\t\t\tflush_interval -1", block)
+
+    def test_plain_proxy_tile_untouched(self) -> None:
+        cfg = full_config(
+            dozzle=False,
+            beszel=False,
+            caddy_domain="",
+            caddy_tiles=["Shop=/shop=127.0.0.1:3000"],
+        )
+        block = _portal_caddy_block(cfg, _tiles(cfg))
+        self.assertIn("\thandle_path /shop/* {\n\t\treverse_proxy 127.0.0.1:3000", block)
+        self.assertNotIn("flush_interval", block)
+
+    def test_access_log_on_by_default_and_disableable(self) -> None:
+        cfg = full_config()
+        block = _portal_caddy_block(cfg, _tiles(cfg))
+        self.assertIn("\tlog {\n\t\toutput stdout\n\t\tformat json\n\t}\n", block)
+        site = installer._caddy_beszel_block(cfg, "monitor.example.com", 8090)
+        self.assertIn("format json", site)
+        self.assertIn("flush_interval -1", site)
+        # диагностика не должна стоить лишних логов, если они не нужны
+        quiet = full_config(caddy_access_log=False)
+        self.assertNotIn("log {", _portal_caddy_block(quiet, _tiles(quiet)))
+        self.assertNotIn("log {", installer._caddy_beszel_block(quiet, "m.example.com", 8090))
+
+
+class BeszelModeTests(unittest.TestCase):
+    """Режим agent: на узле только агент, хаб живёт на другом сервере."""
+
+    def _cfg(self, **overrides) -> Config:
+        kwargs = {
+            "beszel_mode": "agent",
+            "caddy_portal": "",
+            "caddy_tiles": [],
+            "caddy_sites": [],
+            "caddy_domain": "",
+        }
+        kwargs.update(overrides)
+        return full_config(**kwargs)
+
+    def test_agent_compose_has_no_hub(self) -> None:
+        script = installer._beszel_script(self._cfg())
+        bash_check(script)
+        self.assertIn("LISTEN: 45876", script)
+        self.assertNotIn("image: henrygd/beszel:", script)
+        # хаб и агент делят один compose: перезапись убирает контейнер хаба
+        self.assertIn("--remove-orphans", script)
+        self.assertEqual(script.count("container_name: beszel-agent"), 1)
+
+    def test_agent_port_checked_not_hub(self) -> None:
+        verify_script = installer._beszel_verify_script(self._cfg())
+        bash_check(verify_script)
+        self.assertIn("sport = :45876", verify_script)
+        self.assertNotIn("beszel (hub)", verify_script)
+
+    def test_agent_state_template_survives_format(self) -> None:
+        # docker ps -format '{{.Status}}': после str.format одинарные скобки
+        # съедаются, и в сообщение попадает литерал '{.Status}' вместо статуса
+        verify_script = installer._beszel_verify_script(self._cfg())
+        bash_check(verify_script)
+        self.assertIn("'{{.Status}}'", verify_script)
+        self.assertNotIn("'{.Status}'", verify_script)
+        self.assertIn("Restarting*", verify_script)
+
+    def test_hub_mode_keeps_hub(self) -> None:
+        cfg = self._cfg(beszel_mode="hub", caddy_portal="dc.example.com")
+        script = installer._beszel_script(cfg)
+        bash_check(script)
+        self.assertIn("image: henrygd/beszel:0.20.0", script)
+        self.assertIn("image: henrygd/beszel-agent:0.20.0", script)
+        self.assertNotIn(":latest", script)
+        self.assertIn("beszel (hub)", installer._beszel_verify_script(cfg))
+
+    def test_beszel_version_configurable(self) -> None:
+        script = installer._beszel_script(self._cfg(beszel_version="0.21.3"))
+        self.assertIn("image: henrygd/beszel-agent:0.21.3", script)
+
+    def test_bad_beszel_version_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._validate(self._cfg(beszel_version="latest"))
+
+    def test_allow_list_opens_port_for_hub_only(self) -> None:
+        script = installer._beszel_script(
+            self._cfg(beszel_agent_allow=["185.50.202.219/32"])
+        )
+        bash_check(script)
+        self.assertIn(
+            "ufw allow from 185.50.202.219/32 to any port 45876 proto tcp", script
+        )
+        # без активного ufw правило молча не сработает — об этом честно пишем
+        self.assertIn("ufw не активен", script)
+
+    def test_bad_mode_and_cidr_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._validate(self._cfg(beszel_mode="both"))
+        with self.assertRaises(ValueError):
+            installer._validate(self._cfg(beszel_agent_allow=["не адрес"]))
+
+    def test_agent_without_hub_url_only_listens(self) -> None:
+        script = installer._beszel_script(self._cfg())
+        bash_check(script)
+        self.assertNotIn("HUB_URL", script)
+        self.assertIn("хаб ходит к нему по этому порту", script)
+
+    def test_hub_url_makes_agent_dial_out(self) -> None:
+        # Провайдер узла режет входящие порты: агент сам звонит в хаб
+        cfg = self._cfg(
+            beszel_hub_url="monitor.example.com",
+            beszel_agent_allow=["185.50.202.219/32"],
+        )
+        script = installer._beszel_script(cfg)
+        bash_check(script)
+        self.assertIn('HUB_URL: "https://monitor.example.com"', script)
+        self.assertIn("агент сам подключается к хабу", script)
+        # входящий firewall не нужен: хаб к агенту не ходит
+        self.assertNotIn("ufw allow from", script)
+        self.assertIn("соединение инициирует агент", installer._beszel_verify_script(cfg))
+
+    def test_hub_url_keeps_explicit_scheme(self) -> None:
+        script = installer._beszel_script(
+            self._cfg(beszel_hub_url="http://10.0.0.1:8090/")
+        )
+        self.assertIn('HUB_URL: "http://10.0.0.1:8090"', script)
+
+    def test_bad_hub_url_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._validate(self._cfg(beszel_hub_url="https://bad url/"))
+
+    def test_no_monitoring_tile_on_agent_node(self) -> None:
+        cfg = self._cfg(caddy_portal="vpn.fly-server.ru", dozzle=True)
+        names = [tile.name for tile in installer._tiles(cfg)]
+        self.assertIn("Логи", names)
+        self.assertNotIn("Мониторинг", names)
+
+
+EDGE_ID = "3c0b1d6e-9a2f-4c1b-8f7d-5e6a7b8c9d0e"
+EDGE_KEY = (
+    "aHR0cHM6Ly9wb3J0YWluZXIuZXhhbXBsZS5jb218cG9ydGFpbmVyLmV4YW1wbGUuY29tOjgw"
+    "fEZJTkdFUlBSSU5UfDM="
+)
+
+
+class PortainerTests(unittest.TestCase):
+    """Edge-агент: EDGE_ID + EDGE_KEY из UI Portainer вместо join token."""
+
+    def test_server_compose_and_caddy_site(self) -> None:
+        cfg = full_config(
+            portainer=True,
+            portainer_mode="server",
+            portainer_domain="portainer.example.com",
+        )
+        script = installer._portainer_script(cfg)
+        bash_check(script)
+        self.assertIn("image: portainer/portainer-ce:2.45.1", script)
+        # UI только на localhost; туннель — на локальный порт хоста, наружу его
+        # выводит Caddy (провайдер режет всё, кроме 80/443)
+        self.assertIn('"127.0.0.1:9443:9443"', script)
+        self.assertIn('"127.0.0.1:8000:80"', script)
+        self.assertNotIn('"8000:8000"', script)
+        # chisel внутри контейнера слушает 0.0.0.0:80 — иначе publish до туннеля
+        # не доходит и агенты не подключатся
+        self.assertIn("--tunnel-addr=0.0.0.0 --tunnel-port=80", script)
+        site = installer._caddy_portainer_block(cfg, "portainer.example.com", 9443)
+        self.assertIn("tls_insecure_skip_verify", site)
+        self.assertIn("flush_interval -1", site)
+        sites = installer._caddy_sites_script(cfg)
+        self.assertIn("portainer.example.com {", sites)
+        # отдельный сайт на :80 — только websocket, остальное редирект на https
+        self.assertIn("portainer-tunnel.caddy", sites)
+        self.assertIn("http://portainer.example.com {", sites)
+        self.assertIn("@ws header Connection *Upgrade*", sites)
+        self.assertIn("reverse_proxy @ws 127.0.0.1:8000", sites)
+        self.assertIn("redir @notws https://{host}{uri} 308", sites)
+
+    def test_agent_compose_uses_edge_key(self) -> None:
+        cfg = full_config(
+            portainer=True,
+            portainer_mode="agent",
+            portainer_agent_edge_id=EDGE_ID,
+            portainer_agent_edge_key=EDGE_KEY,
+        )
+        script = installer._portainer_script(cfg)
+        bash_check(script)
+        self.assertIn("image: portainer/agent:2.45.1", script)
+        self.assertIn(f'EDGE_ID: "{EDGE_ID}"', script)
+        self.assertIn(f'EDGE_KEY: "{EDGE_KEY}"', script)
+        self.assertIn('EDGE: "true"', script)
+        self.assertIn('EDGE_INSECURE_POLL: "true"', script)
+        # Docker-сокет и volumes видят Docker-операции Portainer через туннель
+        self.assertIn("/var/run/docker.sock:/var/run/docker.sock", script)
+        self.assertIn("/var/lib/docker/volumes:/var/lib/docker/volumes", script)
+        # наружу ничего не публикуем: агент сам ходит на сервер
+        self.assertNotIn("ports:", script)
+        # --join-token в Portainer 2.45 нет, ключ несут переменные окружения
+        self.assertNotIn("--join-token", script)
+        self.assertNotIn("AGENT_CLUSTER_ADDR:", script)
+
+    def test_edge_key_survives_second_run(self) -> None:
+        cfg = full_config(
+            portainer=True,
+            portainer_mode="agent",
+            portainer_agent_edge_id=EDGE_ID,
+        )
+        script = installer._portainer_script(cfg)
+        bash_check(script)
+        # пустой ключ на новом узле не затирает старый, но честно ругается
+        self.assertIn("EDGE_KEY: \"\"", script)
+        self.assertIn("EDGE_KEY пуст", script)
+
+    def test_agent_reports_tunnel_from_key(self) -> None:
+        script = installer._portainer_script(
+            full_config(
+                portainer=True,
+                portainer_mode="agent",
+                portainer_agent_edge_id=EDGE_ID,
+                portainer_agent_edge_key=EDGE_KEY,
+            )
+        )
+        self.assertIn("ws://portainer.example.com:80", script)
+
+    def test_edge_key_kept_when_not_in_config(self) -> None:
+        script = installer._portainer_script(
+            full_config(portainer=True, portainer_mode="agent")
+        )
+        bash_check(script)
+        self.assertIn('EDGE_KEY: "__PORTAINER_EDGE_KEY_KEEP__"', script)
+        self.assertIn('EDGE_ID: "__PORTAINER_EDGE_ID_KEEP__"', script)
+        self.assertIn("PORTAINER_OLD_EDGE_KEY=", script)
+
+    def test_agent_edge_id_and_key_go_together(self) -> None:
+        # без ключа агент не зарегистрируется, без id — тоже; молча ставить
+        # половину хуже, чем отказать до похода в SSH
+        with self.assertRaises(ValueError):
+            installer._validate(
+                full_config(
+                    portainer=True,
+                    portainer_mode="agent",
+                    portainer_agent_edge_id=EDGE_ID,
+                )
+            )
+        with self.assertRaises(ValueError):
+            installer._validate(
+                full_config(
+                    portainer=True,
+                    portainer_mode="agent",
+                    portainer_agent_edge_key=EDGE_KEY,
+                )
+            )
+        with self.assertRaises(ValueError):  # не UUID
+            installer._validate(
+                full_config(
+                    portainer=True,
+                    portainer_mode="agent",
+                    portainer_agent_edge_id="не-uuid",
+                    portainer_agent_edge_key=EDGE_KEY,
+                )
+            )
+        with self.assertRaises(ValueError):  # не base64-ключ Portainer
+            installer._validate(
+                full_config(
+                    portainer=True,
+                    portainer_mode="agent",
+                    portainer_agent_edge_id=EDGE_ID,
+                    portainer_agent_edge_key="portainer_edp_abc",
+                )
+            )
+        # домен задавать не обязательно: адрес сервера лежит в ключе
+        installer._validate(
+            full_config(
+                portainer=True,
+                portainer_mode="agent",
+                portainer_agent_edge_id=EDGE_ID,
+                portainer_agent_edge_key=EDGE_KEY,
+            )
+        )
+        # но если задан — должен совпадать с ключом, иначе агент уйдёт в чужой
+        # Portainer и будет молча молчать в логах
+        with self.assertRaises(ValueError):
+            installer._validate(
+                full_config(
+                    portainer=True,
+                    portainer_mode="agent",
+                    portainer_agent_edge_id=EDGE_ID,
+                    portainer_agent_edge_key=EDGE_KEY,
+                    portainer_domain="other.example.com",
+                )
+            )
+        installer._validate(
+            full_config(
+                portainer=True,
+                portainer_mode="agent",
+                portainer_agent_edge_id=EDGE_ID,
+                portainer_agent_edge_key=EDGE_KEY,
+                portainer_domain="portainer.example.com",
+            )
+        )
+
+    def test_server_requires_domain_and_caddy(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._validate(full_config(portainer=True, portainer_domain=""))
+        with self.assertRaises(ValueError):
+            installer._validate(
+                full_config(
+                    portainer=True,
+                    portainer_domain="portainer.example.com",
+                    caddy=False,
+                )
+            )
+
+    def test_tile_is_external_link(self) -> None:
+        cfg = full_config(
+            portainer=True,
+            portainer_mode="server",
+            portainer_domain="portainer.example.com",
+        )
+        tile = next(t for t in installer._tiles(cfg) if t.name == "Контейнеры")
+        self.assertEqual(tile.href, "https://portainer.example.com/")
+        # под базовым путём портала Portainer не работает — только внешняя ссылка
+        self.assertEqual(tile.path, "")
+
+    def test_bad_mode_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._validate(full_config(portainer=True, portainer_mode="agent2"))
+
+    def test_admin_password_written_as_secret_file(self) -> None:
+        cfg = full_config(
+            portainer=True,
+            portainer_domain="portainer.example.com",
+            portainer_admin_password="Секрет-Пароль-42",
+        )
+        script = installer._portainer_script(cfg)
+        bash_check(script)
+        # пароль не в compose: только путь к файлу 0600
+        self.assertNotIn("Секрет-Пароль-42", script.split("PORTAINER_EOF")[1])
+        self.assertIn(
+            "install -m 0600 -o root -g root", script
+        )
+        self.assertIn(
+            "command: --admin-password-file /run/portainer-admin-password"
+            " --tunnel-addr=0.0.0.0 --tunnel-port=80",
+            script,
+        )
+        # образ запускает сам portainer: command = только флаги, иначе
+        # контейнер уходит в restart с "unexpected portainer"
+        self.assertNotIn("command: portainer", script)
+        # проверка смотрит на путь на хосте, а не внутри контейнера
+        self.assertIn("if [ -f /opt/portainer/admin-password ]", script)
+        self.assertIn('stat -c %a /opt/portainer/admin-password', script)
+
+    def test_without_admin_password_warns_about_window(self) -> None:
+        script = installer._portainer_script(
+            full_config(portainer=True, portainer_domain="portainer.example.com")
+        )
+        bash_check(script)
+        self.assertNotIn("--admin-password-file", script)
+        self.assertIn("5 секунд", script)
+
+    def test_verify_checks_ui_tunnel_and_admin_file(self) -> None:
+        # --verify-only не должен быть слабее установки: UI, туннель и файл
+        # пароля проверяются одинаково
+        cfg = full_config(
+            portainer=True,
+            portainer_domain="portainer.example.com",
+            portainer_admin_password="Секрет-Пароль-42",
+        )
+        script = installer.PORTAINER_VERIFY.format(
+            name="portainer",
+            extra=installer._portainer_extra_verify(cfg),
+        )
+        bash_check(script)
+        self.assertIn("https://127.0.0.1:9443/api/status", script)
+        self.assertIn("sport = :8000", script)
+        # туннель проверяем через Caddy на :80 — ровно тем путём, каким идёт агент
+        self.assertIn("--resolve portainer.example.com:80:127.0.0.1", script)
+        self.assertIn("ws://portainer.example.com:80", script)
+        # присваивание без кавычек вокруг имени: под set -u '"$VAR"=...'
+        # падает с "unbound variable", и bash -n такой опечатки не видит
+        self.assertIn('PORT_TUNNEL_CODE="$(', script)
+        self.assertNotIn('"$PORT_TUNNEL_CODE"=', script)
+        # весь curl одной строкой: внутри $(...) перевод строки разделяет команды
+        self.assertIn(
+            "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw=='"
+            " http://portainer.example.com/ 2>/dev/null",
+            script,
+        )
+        self.assertIn("if [ -f /opt/portainer/admin-password ]", script)
+
+    def test_agent_verify_keeps_edge_key_check(self) -> None:
+        cfg = full_config(
+            portainer=True,
+            portainer_mode="agent",
+            portainer_agent_edge_id=EDGE_ID,
+            portainer_agent_edge_key=EDGE_KEY,
+        )
+        script = installer._portainer_script(cfg)
+        self.assertIn("portainer-agent", script)
+        self.assertIn("EDGE_ID/EDGE_KEY заданы в compose", script)
+
+
+class ForeignCaddyTests(unittest.TestCase):
+    """Чужой контейнер caddy: установщик предупреждает, а не переименовывает."""
+
+    def _caddy_script(self) -> str:
+        return installer.CADDY.format(
+            dir=installer.CADDY_DIR,
+            sites_dir=installer.CADDY_SITES_DIR,
+            portal_dir=installer.PORTAL_DIR,
+            compose=installer.CADDY_COMPOSE,
+            email="you@example.com",
+            caddyfile=installer._caddy_caddyfile("you@example.com"),
+            portal_cleanup=installer._portal_cleanup_script(),
+            sites="",
+            static_volumes="",
+            static_check="",
+        )
+
+    def test_preflight_present_and_safe(self) -> None:
+        script = self._caddy_script()
+        bash_check(script)
+        self.assertIn("project.working_dir", script)
+        self.assertIn("docker rename caddy caddy-prev", script)
+        # установщик не имеет права молча трогать чужой контейнер
+        self.assertNotIn("docker rm -f caddy\n", script.replace("      $SUDO docker rm -f caddy", ""))
+        self.assertIn("exit 1", script)
+
+    def test_preflight_runs_before_compose_write(self) -> None:
+        script = self._caddy_script()
+        self.assertLess(script.index("FOREIGN_CADDY=\"\""), script.index("CADDY_COMPOSE_EOF"))
+        self.assertNotIn("{$caddy_id}", script)
+
+    def test_container_starts_before_sites(self) -> None:
+        # пароль портала хешируется через `docker exec caddy`: на первом
+        # запуске контейнера ещё нет, и сайты до `compose up` падали бы
+        cfg = full_config(portal_password="test-portal-pass-42")
+        tiles = installer._tiles(cfg)
+        script = installer.CADDY.format(
+            dir=installer.CADDY_DIR,
+            sites_dir=installer.CADDY_SITES_DIR,
+            portal_dir=installer.PORTAL_DIR,
+            compose=installer.CADDY_COMPOSE,
+            email=cfg.caddy_email,
+            caddyfile=installer._caddy_caddyfile(cfg.caddy_email),
+            portal_cleanup=installer._portal_cleanup_script(),
+            sites=installer._caddy_sites_script(cfg, portal=True)
+            + installer._portal_script(cfg, tiles),
+            static_volumes="",
+            static_check="",
+        )
+        bash_check(script)
+        up = script.index(f"docker compose -f {installer.CADDY_COMPOSE} up -d")
+        first_site = script.index("CADDY_SITE_EOF")
+        hash_call = script.index("PORTAL_HASH=$(printf")
+        self.assertLess(up, first_site)
+        self.assertLess(up, hash_call)
+        # хеш обязан быть посчитан ДО записи portal.caddy: заглушка
+        # __PORTAL_HASH__ невалидна для Caddy и роняет контейнер
+        self.assertLess(hash_call, script.index("tee /opt/caddy/sites/portal.caddy"))
+        self.assertLess(
+            script.index("tee /opt/caddy/sites/portal.caddy"),
+            script.index("__PORTAL_HASH__|"),
+        )
+
+    def test_broken_portal_site_removed_before_start(self) -> None:
+        # остаток неудачного прогона: portal.caddy с заглушкой вместо хеша
+        # не даёт контейнеру подняться, а следующий прогон падает на exec
+        script = self._caddy_script()
+        cleanup = script.index("битый portal.caddy")
+        self.assertLess(cleanup, script.index("compose -f /opt/caddy/docker-compose.yml up -d"))
+        self.assertIn("2[aby]", script)
+
+    def test_hash_pattern_is_ere_not_bre(self) -> None:
+        # в ERE `\|` — литеральный пайп: с ним валидный хеш $2a$ никогда не
+        # совпал бы, и битый portal.caddy удалялся бы на каждом прогоне
+        cleanup = installer._portal_cleanup_script()
+        self.assertIn(r"'\$(2[aby]|argon2id)\$'", cleanup)
+        self.assertNotIn(r"\|", cleanup)
+        # настоящий bcrypt-хеш должен считаться валидным файлом
+        valid = "www.example.com {\n\tbasic_auth {\n\t\tadmin $2a$14$abcdefghij\n\t}\n}\n"
+        for pattern in (r"\$(2[aby]|argon2id)\$",):
+            proc = subprocess.run(
+                ["grep", "-qE", pattern],
+                input=valid,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, f"{pattern} не нашёл валидный хеш")
+        for content in ("__PORTAL_HASH__", ""):
+            proc = subprocess.run(
+                ["grep", "-qE", r"\$(2[aby]|argon2id)\$"],
+                input=f"www.example.com {{\n\tbasic_auth {{\n\t\tadmin {content}\n\t}}\n}}\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0, f"заглушка {content!r} принята за хеш")
+
+    def test_broken_portal_forces_recreate(self) -> None:
+        # контейнер читает конфиг только при старте, а после серии падений
+        # docker держит паузу (backoff) — без пересоздания он продолжит
+        # падать на старой версии конфига
+        script = self._caddy_script()
+        cleanup = script.index("битый portal.caddy")
+        recreate = script.index("--force-recreate")
+        self.assertLess(cleanup, recreate)
+        self.assertIn("--remove-orphans", script)
+
+
+class StaticSiteTests(unittest.TestCase):
+    """Сайт-статика: caddy_site вида "домен=file:/каталог"."""
+
+    def test_static_site_serves_directory(self) -> None:
+        cfg = full_config(caddy_sites=["www.example.com=file:/var/www"])
+        block = installer._caddy_static_block(cfg, "www.example.com", "/var/www")
+        self.assertIn("root * /var/www", block)
+        self.assertIn("file_server", block)
+        self.assertNotIn("reverse_proxy", block)
+        script = installer._caddy_sites_script(cfg)
+        self.assertIn("www.example.com {", script)
+        self.assertIn("root * /var/www", script)
+        self.assertIn("/opt/caddy/sites/www.example.com.caddy", script)
+
+    def test_site_script_keeps_proxy_mode(self) -> None:
+        cfg = full_config(caddy_sites=["shop.example.com=127.0.0.1:3000"])
+        self.assertIn("reverse_proxy 127.0.0.1:3000", installer._caddy_sites_script(cfg))
+
+    def test_bad_root_rejected(self) -> None:
+        for root in ("file:relative/dir", "file:/var/www/../etc", "file:/var/w ww"):
+            with self.assertRaises(ValueError):
+                installer._caddy_sites_script(full_config(caddy_sites=[f"x.example.com={root}"]))
+
+    def test_reserved_root_rejected(self) -> None:
+        # каталог статики нельзя навести на пути контейнера caddy: mount
+        # перекроет конфиг, сертификаты или сам каталог портала
+        for root in ("/etc/caddy", "/etc/caddy/sites", "/srv/portal", "/data", "/config/cfg"):
+            with self.assertRaises(ValueError):
+                installer._caddy_sites_script(full_config(caddy_sites=[f"x.example.com=file:{root}"]))
+
+    def test_static_root_mounted_into_container(self) -> None:
+        # сеть host не даёт контейнеру видеть файловую систему хоста: без
+        # bind-mount статики caddy отдаёт 404 на каждый файл
+        cfg = full_config(caddy_sites=["www.example.com=file:/var/www"])
+        roots = installer._static_roots(cfg)
+        self.assertEqual(roots, ["/var/www"])
+        script = installer.CADDY.format(
+            dir=installer.CADDY_DIR,
+            sites_dir=installer.CADDY_SITES_DIR,
+            portal_dir=installer.PORTAL_DIR,
+            compose=installer.CADDY_COMPOSE,
+            email=cfg.caddy_email,
+            caddyfile=installer._caddy_caddyfile(cfg.caddy_email),
+            portal_cleanup="",
+            sites="",
+            static_volumes=installer._static_volumes(roots),
+            static_check=installer._static_roots_check(roots),
+        )
+        bash_check(script)
+        self.assertIn("      - /var/www:/var/www:ro\n", script)
+        # каталога нет — docker создал бы пустой, нужен явный предупреждение
+        self.assertIn('if [ ! -d "/var/www" ]', script)
+
+    def test_static_roots_deduplicated(self) -> None:
+        cfg = full_config(
+            caddy_sites=[
+                "www.example.com=file:/var/www",
+                "old.example.com=static:/var/www",
+                "shop.example.com=127.0.0.1:3000",
+            ]
+        )
+        self.assertEqual(installer._static_roots(cfg), ["/var/www"])
+        self.assertEqual(installer._static_volumes(["/var/www"]), "      - /var/www:/var/www:ro\n")
+
+
 class BeszelUrlTests(unittest.TestCase):
     def test_portal_url(self) -> None:
         self.assertEqual(
@@ -618,6 +1209,28 @@ class GeneratedScriptTests(unittest.TestCase):
             script.index(f"tee {installer.BESZEL_COMPOSE}"),
         )
         bash_check(script)
+
+    def test_key_warning_follows_compose_not_config(self) -> None:
+        # ключ мог быть сохранён с хоста: предупреждение обязано смотреть в
+        # записанный compose, иначе агент ругается «не задан ключ» при
+        # полностью рабочей связке с хабом
+        script = self._install_script(
+            full_config(beszel_agent_key="", beszel_agent_token="")
+        )
+        bash_check(script)
+        self.assertIn("""grep -qE '^      KEY: ""$'""", script)
+        self.assertIn("""grep -qE '^      TOKEN: ""$'""", script)
+        # в блоке beszel больше нет проверки «пусто ли значение в конфиге»
+        beszel = script[script.index("BESZEL_EOF") : script.index("docker compose -f")]
+        self.assertNotIn("if [ -z ", beszel)
+        # с заданным ключом в конфиге предупреждение не появится: в compose
+        # будет непустое значение
+        with_key = self._install_script(
+            full_config(beszel_agent_key="ssh-ed25519 AAAA", beszel_agent_token="t0ken")
+        )
+        bash_check(with_key)
+        self.assertIn('KEY: "ssh-ed25519 AAAA"', with_key)
+        self.assertIn('TOKEN: "t0ken"', with_key)
 
     def test_beszel_key_read_survives_missing_compose(self) -> None:
         # регрессия (найдено на чистом Ubuntu 26.04): compose на пустом хосте

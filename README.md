@@ -14,7 +14,12 @@
 
 | Что | Флаг / ключ | Про что |
 | --- | --- | --- |
-| Мониторинг | `--beszel` | Beszel Hub + Agent одним `docker compose` (порт 8090), ключ/токен агента — `--beszel-key` / `--beszel-token` |
+| Мониторинг | `--beszel` | Beszel: хаб + агент на одном сервере (порт 8090), ключ/токен агента — `--beszel-key` / `--beszel-token` |
+| Мониторинг, ведущий узел | `--beszel --beszel-mode agent --beszel-agent-allow ХОСТ` | Только агент: хаб на другом сервере стучится к агенту на `45876`; `--beszel-agent-allow` открывает порт только перечисленным хостам |
+| Мониторинг, узел за firewall | `--beszel --beszel-mode agent --beszel-hub-url https://monitor.example.com` | Агент сам подключается к хабу исходящим WebSocket — когда провайдер режет входящий `45876` |
+| Версии образов | `--beszel-version`, `--portainer-version` | Образы запинены: hub и agent Beszel, сервер и агенты Portainer должны быть одной версии |
+| Контейнеры | `--portainer` | Portainer CE на отдельном домене `--portainer-domain` (UI 9443, туннель агентов через Caddy по 80) |
+| Управление с узла | `--portainer --portainer-mode agent --portainer-domain ДОМЕН --portainer-agent-edge-id ID --portainer-agent-edge-key KEY` | Только edge-агент: сам ходит в центральный Portainer, входящих портов не нужно |
 | Вход без пароля | `--beszel-user-creation` + `--beszel-disable-password-auth` | OAuth2 вместо пароля (провайдер настраивается в веб-UI Hub) |
 | HTTPS | `--caddy`, `--caddy-email` | Caddy в `network_mode: host`, сертификаты Let's Encrypt сами, HTTP → HTTPS |
 | Портал | `--caddy-portal ДОМЕН`, `--caddy-tile` | Страница с плитками сервисов; сервисы — под путями `/мониторинг`, `/thinpro` |
@@ -130,6 +135,106 @@ install-vps dev.fly-server.ru \
 
 Пароль портала — секрет: держите его в локальной копии конфига
 (`config.local.toml`, она в `.gitignore`), а не в `config.toml` из репозитория.
+
+### Централизованный мониторинг и контейнеры
+
+Мониторинг и управление контейнерами можно вынести на один сервер, а остальные
+сделать «узлами» — агентами без своего хаба и UI.
+
+Центральный сервер (например `dc`):
+
+```bash
+install-vps dc.fly-server.ru \
+  --beszel --beszel-mode hub \
+  --dozzle \
+  --portainer --portainer-domain portainer.fly-server.ru \
+  --portainer-admin-password '...' \
+  --caddy --caddy-portal dc.fly-server.ru \
+  --caddy-tile 'Мониторинг=https://monitor.fly-server.ru' \
+  --caddy-email you@example.com
+```
+
+Узел:
+
+```bash
+install-vps vpn.fly-server.ru \
+  --beszel --beszel-mode agent \
+  --beszel-agent-key 'ssh-ed25519 AAAA...' --beszel-token 'xxxx-xxxx' \
+  --beszel-agent-allow 185.50.202.219/32 \
+  --portainer --portainer-mode agent \
+  --portainer-domain portainer.fly-server.ru \
+  --portainer-agent-edge-id '3c0b1d6e-...' \
+  --portainer-agent-edge-key 'aHR0cHM6Ly9wb3J0YWluZXIu...'
+```
+
+Beszel в режиме `agent` поднимает только `beszel-agent` (порт `45876`) и ждёт,
+пока хаб стучится к нему: ключ и токен выдаёт веб-UI хаба (Add system) и
+потом не меняются. Повторный прогон без ключей не затирает прежние — compose
+дополняется маркером, который заменяется на сохранённые значения. Порт агента
+наружу открывается только если ufw активен; иначе скрипт честно печатает, что
+правило не сработало, и какой порт нужно открыть.
+
+Если порт открыть нельзя (провайдер режет входящие высокие порты), укажите
+`--beszel-hub-url https://monitor.example.com`: агент сам подключится к хабу
+исходящим WebSocket, и `--beszel-agent-allow` не нужен вовсе. Проверка порта
+агента в этом режиме не ругается — соединение всё равно инициирует агент.
+
+Portainer CE в режиме `server` публикует UI только на `127.0.0.1:9443`
+(наружу его отдаёт Caddy на `--portainer-domain`), а туннель edge-агентов
+слушает 80 внутри контейнера и опубликован на `127.0.0.1:8000`. Наружу его
+отдаёт сайт `portainer-tunnel`: в `reverse_proxy` уходят только запросы с
+WebSocket-upgrade, всё остальное уходит на HTTPS. Так туннель остаётся
+достижимым, когда наружу открыты только 80 и 443. Первого администратора
+нужно создать в первые 5 секунд после старта, иначе UI его больше не
+предложит: передайте `--portainer-admin-password`, пароль ляжет на хост файлом
+0600 и уйдёт в контейнер через `--admin-password-file` (в compose и
+`docker inspect` его нет).
+
+В режиме `agent` ставится `portainer/agent` без входящих портов: он сам ходит
+в хаб по `--portainer-agent-edge-id` и `--portainer-agent-edge-key` из UI
+Portainer (Environments → Add environment → Edge Agent Standard). Join-токена
+у Portainer 2.45.1 нет, и пустая пара ID/KEY прежний ключ не затирает, но
+проверка на хосте честно скажет, что агент не зарегистрируется. Ключ
+разбирается заранее: в нём публичный URL сервера, host:port для туннеля и
+отпечаток chisel — если адрес не совпадёт с `--portainer-domain`, установка
+остановится ещё до похода в SSH.
+
+Перевод существующего сервера с «хаб+агент» на «только агент» — тот же вызов с
+`--beszel-mode agent`: compose перезаписывается, а бывший контейнер хаба
+удаляется (`docker compose up -d --remove-orphans`). Плитка `Мониторинг` в
+портале такого узла пропадает: мониторинг открывается на центральном сервере.
+Ключ и токен, уже настроенные на узле, при этом сохраняются — так узел
+переключается на новый хаб без ручного копирования секретов.
+
+### Статика и уже занятое имя `caddy`
+
+Сайт-статика задаётся как `домен=file:/каталог`:
+
+```bash
+install-vps dc.fly-server.ru \
+  --caddy --caddy-site 'www.fly-server.ru=file:/var/www'
+```
+
+Caddy работает с `network_mode: host` и не видит файловую систему хоста, поэтому
+каждый такой каталог **монтируется в контейнер read-only** отдельной строкой в
+compose — без неё сайт отдавал бы 404 на каждый файл. Каталоги `/etc/caddy`,
+`/srv/portal`, `/data`, `/config` для статики запрещены: mount перекрыл бы
+конфиг, сертификаты или страницу портала. Отсутствующий каталог не создаётся
+молча (docker сделал бы пустой root-owned) — установщик печатает предупреждение.
+
+Если на хосте уже есть контейнер с именем `caddy` из чужого compose-проекта
+(например `dockprom`), установщик **остановится и объяснит**, что делать, но
+чужой контейнер не тронет. Дальше на ваше усмотрение: удалить его
+(`docker rm -f caddy`) либо освободить имя
+(`docker stop caddy && docker rename caddy caddy-prev`; в его compose
+`container_name` тоже стоит поменять, иначе `docker compose up` снова
+потребует имя `caddy`).
+
+Портал пересобирается при каждом прогоне, а его пароль хеширует сам Caddy
+(`caddy hash-password` через `docker exec`). Поэтому контейнер поднимается
+**до** генерации сайтов, а заглушка вместо хеша от прошлого неудачного прогона
+(`portal.caddy` с `__PORTAL_HASH__`) удаляется перед стартом с пересозданием
+контейнера — иначе он продолжал бы падать на старой версии конфига.
 
 ## Структура
 

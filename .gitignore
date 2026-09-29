@@ -220,3 +220,5 @@ __marimo__/
 # Локальные секреты: этот файл НЕ коммитится (см. .gitignore).
 # Копия config.toml с паролем портала и ключами агента.
 config.local.toml
+# ...и любые per-host копии с секретами: config.dc.local.toml, config.ai.local.toml
+config.*.local.toml
