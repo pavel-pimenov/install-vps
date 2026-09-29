@@ -143,6 +143,12 @@ beszel_path = "/monitor"
 # только импортирует их, так что новый сайт = одна строка здесь.
 caddy_sites = [
     "thinpro.fly-server.ru=127.0.0.1:8080",
+    # Сайт-статика: file:/каталог — Caddy отдаёт каталог сам, без прокси.
+    # Опции после "|" повторяют то, что задавал lighttpd, с которого сайт
+    # переезжает: browse — листинг каталогов, index — приоритет индексных
+    # файлов, hide — что не показывать в листинге, deny — какие файлы не
+    # отдавать вовсе (403). Без них сайт получится голым file_server.
+    # "etc.fly-server.ru=file:/var/www/etc|browse|index=index.html,index.lighttpd.html|hide=.svn,*.lua",
 ]
 # Страница портала: /opt/caddy/portal/index.html (генерируется из caddy_tiles).
 # Перечитать конфиг: docker exec caddy caddy reload --config /etc/caddy/Caddyfile

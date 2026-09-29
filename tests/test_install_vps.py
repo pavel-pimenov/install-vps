@@ -1075,6 +1075,68 @@ class StaticSiteTests(unittest.TestCase):
         self.assertEqual(installer._static_roots(cfg), ["/var/www"])
         self.assertEqual(installer._static_volumes(["/var/www"]), "      - /var/www:/var/www:ro\n")
 
+    def test_browse_index_hide_reproduce_lighttpd(self) -> None:
+        # те же опции, что задавал lighttpd на мигрируемых сайтах
+        cfg = full_config(
+            caddy_sites=[
+                "etc.example.com=file:/var/www/etc|browse"
+                "|index=index.html,index.lighttpd.html|hide=.svn,*.lua"
+            ]
+        )
+        script = installer._caddy_sites_script(cfg)
+        bash_check(script)
+        self.assertIn("\tfile_server browse {\n", script)
+        self.assertIn("\t\tindex index.html index.lighttpd.html\n", script)
+        self.assertIn("\t\thide .svn *.lua\n", script)
+        self.assertIn("\t}\n", script)
+
+    def test_browse_only_when_listed(self) -> None:
+        # пустой список значений для browse — флаг, а не «листинг выключен»
+        opts = installer._static_options("browse|index=index.html")
+        self.assertIn("browse", opts)
+        self.assertIn("file_server browse", installer._caddy_static_block(
+            full_config(), "x.example.com", "/var/www", opts))
+
+    def test_deny_becomes_403_matcher(self) -> None:
+        # у caddy нет директивы deny: путь ловит matcher, ответ — respond
+        cfg = full_config(caddy_sites=["etc.example.com=file:/var/www|deny=*.inc,*.php,*~"])
+        script = installer._caddy_sites_script(cfg)
+        bash_check(script)
+        self.assertIn("\t@forbidden path *.inc *.php *~\n", script)
+        self.assertIn("\trespond @forbidden 403\n", script)
+        # respond в порядке директив caddy идёт раньше file_server
+        self.assertLess(script.index("respond @forbidden"), script.index("file_server"))
+
+    def test_options_rejected_on_proxy_site(self) -> None:
+        with self.assertRaises(ValueError):
+            installer._caddy_sites_script(
+                full_config(caddy_sites=["shop.example.com=127.0.0.1:3000|browse"])
+            )
+
+    def test_bad_options_rejected(self) -> None:
+        for options in (
+            "brouse",            # опечатка
+            "index=",            # пустой список
+            "hide=a b",          # пробел ломает разбор
+            "index=../etc",      # путь, а не имя файла
+            "x=1",               # неизвестная опция
+            "browse||hide=.svn",  # пустая опция между разделителями
+        ):
+            with self.assertRaises(ValueError):
+                installer._caddy_sites_script(
+                    full_config(caddy_sites=[f"etc.example.com=file:/var/www|{options}"])
+                )
+
+    def test_trailing_separator_tolerated(self) -> None:
+        # хвостовой | — обычная описка при склейке строк, а не ошибка
+        cfg = full_config(caddy_sites=["etc.example.com=file:/var/www|browse|"])
+        self.assertIn("\tfile_server browse\n", installer._caddy_sites_script(cfg))
+
+    def test_root_parsed_without_options(self) -> None:
+        # хвост опций не должен попадать в bind-mount: каталога "…|browse" нет
+        cfg = full_config(caddy_sites=["etc.example.com=file:/var/www/etc|browse"])
+        self.assertEqual(installer._static_roots(cfg), ["/var/www/etc"])
+
 
 class BeszelUrlTests(unittest.TestCase):
     def test_portal_url(self) -> None:

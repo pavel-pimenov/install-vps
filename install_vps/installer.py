@@ -112,6 +112,12 @@ _HOSTNAME_RE = re.compile(
 _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 # тег образа Beszel: hub и agent обязаны совпадать, «latest» недопустим
 _SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+# опции сайта-статики в caddy_site: browse, index=..., hide=..., deny=...
+_STATIC_OPTION_RE = re.compile(
+    r"^(browse|index|hide|deny)(=([A-Za-z0-9.*_~!+-]+(,[A-Za-z0-9.*_~!+-]+)*)?)?$"
+)
+# шаблон имени файла для index/hide/deny: буквы, цифры и маски (* . ~ - _ ! +)
+_STATIC_ITEM_RE = re.compile(r"^[A-Za-z0-9.*_~!+-]+$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # адрес или CIDR: beszel_agent_allow открывает порт агента конкретным хостам
 _CIDR_RE = re.compile(
@@ -238,20 +244,81 @@ def _caddy_site_block(domain: str, upstream: str) -> str:
     return f"{domain} {{\n\treverse_proxy {upstream}\n}}\n"
 
 
-def _caddy_static_block(cfg: Config, domain: str, root: str) -> str:
+def _split_site(raw: str) -> tuple[str, str, str]:
+    """'ДОМЕН=UPSTREAM|опции' -> (домен, upstream, хвост опций статики)."""
+    domain, sep, rest = raw.partition("=")
+    if not sep:
+        raise ValueError(
+            f"caddy_site должен быть вида ДОМЕН=UPSTREAM, а получено {raw!r}"
+        )
+    upstream, _, options = rest.partition("|")
+    options = options.strip()
+    if options.endswith("|"):  # хвостовой разделитель — обычная описка при склейке
+        options = options[:-1].rstrip()
+    return domain.strip(), upstream.strip(), options
+
+
+def _static_options(options: str) -> dict[str, list[str]]:
+    """Опции file_server из хвоста 'browse|index=a,b|hide=.svn'."""
+    parsed: dict[str, list[str]] = {}
+    for part in options.split("|"):
+        chunk = part.strip()
+        if not chunk:
+            if options:
+                raise ValueError(f"Пустая опция среди разделителей | в caddy_site: {options!r}")
+            continue
+        if not _STATIC_OPTION_RE.match(chunk):
+            raise ValueError(
+                f"Неизвестная опция сайта-статики: {chunk!r}; поддерживаются "
+                "browse, index=файл,файл, hide=шаблон, deny=шаблон"
+            )
+        name, _, values = chunk.partition("=")
+        items = [item.strip() for item in values.split(",") if item.strip()]
+        if name != "browse" and not items:
+            raise ValueError(f"Опции {name} в caddy_site нуждаются в значениях: {chunk!r}")
+        bad = [item for item in items if not _STATIC_ITEM_RE.match(item)]
+        if bad:
+            raise ValueError(
+                f"Недопустимые значения опции {name} в caddy_site: "
+                f"{', '.join(bad)}; нужен шаблон имени файла — буквы, цифры, "
+                ". * _ ~ -"
+            )
+        parsed[name] = items
+    return parsed
+
+
+def _caddy_static_block(
+    cfg: Config, domain: str, root: str, options: dict[str, list[str]] | None = None
+) -> str:
     """Сайт-статика: домен -> каталог на хосте (вместо прокси).
 
     Нужен, когда 80/443 переезжают с другого веб-сервера (например с
     lighttpd) на Caddy: его содержимое переносится сайтом, а не выбрасывается.
+
+    Опции повторяют то, что задавал lighttpd: `browse` — листинг каталогов,
+    `index` — приоритет индексных файлов, `hide` — что не показывать в
+    листинге, `deny` — какие файлы не отдавать вовсе (403). Без них сайт
+    получится голым file_server, и миграция тихо потеряет половину настроек.
     """
-    return (
-        f"{domain} {{\n"
-        + _access_log_block(cfg)
-        + f"\troot * {root}\n"
-        "\tfile_server\n"
-        "\tencode gzip\n"
-        "}\n"
-    )
+    opts = options or {}
+    lines = [f"\troot * {root}"]
+    if opts.get("deny"):
+        lines.append("\t@forbidden path " + " ".join(opts["deny"]))
+        lines.append("\trespond @forbidden 403")
+    inner = []
+    if opts.get("index"):
+        inner.append("index " + " ".join(opts["index"]))
+    if opts.get("hide"):
+        inner.append("hide " + " ".join(opts["hide"]))
+    head = "file_server browse" if "browse" in opts else "file_server"
+    if inner:
+        lines.append(f"\t{head} {{")
+        lines.extend(f"\t\t{line}" for line in inner)
+        lines.append("\t}")
+    else:
+        lines.append(f"\t{head}")
+    lines.append("\tencode gzip")
+    return f"{domain} {{\n" + _access_log_block(cfg) + "\n".join(lines) + "\n}\n"
 
 
 def _access_log_block(cfg: Config) -> str:
@@ -368,8 +435,7 @@ def _static_roots(cfg: Config) -> list[str]:
     """Каталоги статики из caddy_site вида "домен=file:/var/www" (без дублей)."""
     roots: list[str] = []
     for raw in cfg.caddy_sites:
-        _, _, upstream = raw.partition("=")
-        upstream = upstream.strip()
+        _, upstream, _ = _split_site(raw)
         if not upstream.startswith(("file:", "static:")):
             continue
         root = upstream.split(":", 1)[1].strip()
@@ -420,12 +486,7 @@ def _caddy_sites_script(cfg: Config, portal: bool = False) -> str:
             )
         )
     for raw in cfg.caddy_sites:
-        domain, sep, upstream = raw.partition("=")
-        if not sep:
-            raise ValueError(
-                f"caddy_site должен быть вида ДОМЕН=UPSTREAM, а получено {raw!r}"
-            )
-        domain, upstream = domain.strip(), upstream.strip()
+        domain, upstream, raw_options = _split_site(raw)
         if not _HOSTNAME_RE.match(domain):
             raise ValueError(f"Некорректный домен в caddy_site: {domain!r}")
         if upstream.startswith(("file:", "static:")):
@@ -441,8 +502,14 @@ def _caddy_sites_script(cfg: Config, portal: bool = False) -> str:
                     f"Caddy ({', '.join(_STATIC_ROOT_RESERVED)}) — выберите другой, "
                     "напр. file:/var/www"
                 )
-            sites.append((domain, _caddy_static_block(cfg, domain, root)))
+            options = _static_options(raw_options)
+            sites.append((domain, _caddy_static_block(cfg, domain, root, options)))
             continue
+        if raw_options:
+            raise ValueError(
+                f"Опции {raw_options!r} в caddy_site {domain!r} работают только "
+                "для сайта-статики (file:/static:)"
+            )
         if not _UPSTREAM_RE.match(upstream):
             raise ValueError(f"Некорректный upstream в caddy_site: {upstream!r}")
         sites.append((domain, _caddy_site_block(domain, upstream)))
