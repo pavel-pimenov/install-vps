@@ -110,6 +110,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--portainer-version", metavar="ВЕРСИЯ",
                    help="версия образов portainer-ce и portainer/agent "
                         "(по умолчанию 2.45.1; сервер и агенты должны совпадать)")
+    p.add_argument(
+        "--portainer-local-env",
+        metavar="ИМЯ",
+        help="создать локальное окружение Portainer с таким именем: без него "
+        "в списке узлов нет самого сервера, хотя docker socket хоста под рукой",
+    )
     p.add_argument("--portainer-admin-password", metavar="ПАРОЛЬ",
                    help="пароль первого администратора Portainer: окно создания "
                         "admin в UI длится 5 секунд, потом портал его больше не "

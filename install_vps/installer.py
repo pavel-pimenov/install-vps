@@ -110,6 +110,8 @@ _HOSTNAME_RE = re.compile(
     r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
 )
 _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+# имя окружения попадает в JSON и в grep, поэтому набор символов минимальный
+_ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,30}$")
 # тег образа Beszel: hub и agent обязаны совпадать, «latest» недопустим
 _SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 # опции сайта-статики в caddy_site: browse, index=..., hide=..., deny=...
@@ -1974,6 +1976,30 @@ def _validate_portainer_agent(cfg: Config) -> None:
                     )
 
 
+def _validate_portainer_local_env(cfg: Config) -> None:
+    """Локальное окружение создаёт только сервер Portainer.
+
+    API есть лишь у сервера: на edge-узле запрос ушёл бы в никуда, а без
+    portainer фрагмент вообще не попадает в скрипт и опция молча ничего
+    не сделала бы. Имя окружения подставляется в JSON и в grep, поэтому
+    набор символов минимальный (_ENV_NAME_RE).
+    """
+    if not cfg.portainer_local_env:
+        return
+    if not cfg.portainer or cfg.portainer_mode != "server":
+        raise ValueError(
+            "portainer_local_env требует portainer в режиме server: локальное "
+            "окружение создаётся через API самого сервера "
+            "(--portainer --portainer-mode server)"
+        )
+    if not _ENV_NAME_RE.match(cfg.portainer_local_env):
+        raise ValueError(
+            f"Некорректное portainer_local_env: {cfg.portainer_local_env!r}; "
+            "имя окружения — латиница, цифры, точка, дефис и подчёркивание "
+            "(до 31 символа), без пробелов и кавычек"
+        )
+
+
 def _validate_modes(cfg: Config) -> None:
     """Проверки режимов Beszel/Portainer и их доменов.
 
@@ -1991,6 +2017,7 @@ def _validate_modes(cfg: Config) -> None:
             f"Неизвестный portainer_mode: {cfg.portainer_mode!r}; "
             "доступны: server, agent"
         )
+    _validate_portainer_local_env(cfg)
     if cfg.portainer and cfg.portainer_mode == "server":
         if not cfg.portainer_domain:
             raise ValueError(
@@ -2454,6 +2481,68 @@ def _portainer_extra_verify(cfg: Config) -> str:
     )
 
 
+PORTAINER_LOCAL_ENV = r"""
+# Локальное окружение: сам сервер в списке узлов Portainer. Type=1 —
+# «Docker Standalone», он берёт docker socket хоста, контейнер-агент не нужен.
+# Пароль берём с файла 0600 на хосте, а не из конфига: после смены пароля в UI
+# файл устаревает, и установщик должен честно сказать об этом, а не лезть
+# в API со старым. Пароль в UI Portainer сервер не трогает при повторных
+# прогонах: он пропускает --admin-password-file, если admin уже есть.
+# файл пароля принадлежит root, поэтому читать его нужно через $SUDO
+PW_LOCAL="$($SUDO cat {admin_file} 2>/dev/null || true)"
+if [ -z "$PW_LOCAL" ]; then
+  echo "  ВНИМАНИЕ: нет {admin_file} — локальное окружение «{name}» не создано"
+else
+  # контейнер только что поднят: даём API несколько секунд на просыпание,
+  # иначе первый curl поймает отказ в соединении и напечатает ложное
+  # «не удалось войти»
+  for _ in $(seq 1 30); do
+    CODE_LOCAL="$(curl -sk -o /dev/null -m 5 -w '%{{http_code}}' \
+      https://127.0.0.1:{port}/api/status 2>/dev/null || true)"
+    [ "$CODE_LOCAL" = "200" ] && break
+    sleep 2
+  done
+  unset CODE_LOCAL
+  # || true обязателен: под pipefail и set -e неудачный curl (portainer не
+  # поднялся, TLS не сошёлся) иначе уронит весь скрипт вместо честного
+  # предупреждения ниже
+  JWT_LOCAL="$(curl -sk -m 10 -X POST https://127.0.0.1:{port}/api/auth \
+    -H 'Content-Type: application/json' \
+    -d "{{\"username\":\"admin\",\"password\":\"$PW_LOCAL\"}}" \
+    | sed -n 's/.*"jwt":"\([^"]*\)".*/\1/p' || true)"
+  unset PW_LOCAL
+  if [ -z "$JWT_LOCAL" ]; then
+    echo "  ВНИМАНИЕ: не удалось войти в Portainer API — локальное окружение"
+    echo "    «{name}» не создано. Если пароль admin меняли в UI, новый секрет"
+    echo "    лежит вне install-vps: пропишите его в portainer_admin_password"
+    echo "    (он сработает только на чистой базе) либо добавьте узел вручную."
+  elif curl -sk -H "Authorization: Bearer $JWT_LOCAL" \
+      https://127.0.0.1:{port}/api/endpoints | grep -q '"Name":"{name}"'; then
+    echo "  OK: локальное окружение «{name}» уже есть"
+  elif curl -sk -X POST https://127.0.0.1:{port}/api/endpoints \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer $JWT_LOCAL" \
+      -d "{{\"Name\":\"{name}\",\"Type\":1,\"GroupId\":1}}" | grep -q '"Id"'; then
+    echo "  OK: локальное окружение «{name}» создано (docker socket хоста)"
+  else
+    echo "  ВНИМАНИЕ: Portainer не принял запрос на создание окружения"
+  fi
+  unset JWT_LOCAL
+fi
+"""
+
+
+def _portainer_local_env_script(cfg: Config) -> str:
+    """Создание локального окружения Portainer по admin-паролю."""
+    if not cfg.portainer_local_env:
+        return ""
+    return PORTAINER_LOCAL_ENV.format(
+        name=cfg.portainer_local_env,
+        port=cfg.portainer_port,
+        admin_file=PORTAINER_ADMIN_FILE,
+    )
+
+
 def _portainer_script(cfg: Config) -> str:
     """Фрагмент установки Portainer CE: сервер с UI либо edge-агент узла."""
     edge_id, edge_key = cfg.portainer_agent_edge_id, cfg.portainer_agent_edge_key
@@ -2541,7 +2630,8 @@ def _portainer_script(cfg: Config) -> str:
         token_read=edge_read,
         token_fix=edge_fix,
         name=name,
-    ) + PORTAINER_VERIFY.format(name=name, extra=extra, image_check=_portainer_image_check(cfg))
+    ) + PORTAINER_VERIFY.format(name=name, extra=extra, image_check=_portainer_image_check(cfg)) \
+    + _portainer_local_env_script(cfg)
 
 
 def install(cfg: Config, host: RemoteHost) -> None:
@@ -2628,7 +2718,7 @@ def verify(cfg: Config, host: RemoteHost) -> None:
             name="portainer" if cfg.portainer_mode == "server" else "portainer-agent",
             extra=_portainer_extra_verify(cfg) if cfg.portainer_mode == "server" else "",
             image_check=_portainer_image_check(cfg),
-        )
+        ) + _portainer_local_env_script(cfg)
     if cfg.dozzle:
         script += _dozzle_verify_script(cfg)
     if cfg.caddy:

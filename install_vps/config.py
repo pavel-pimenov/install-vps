@@ -78,6 +78,10 @@ class Config:
     portainer_agent_edge_id: str = ""
     portainer_agent_edge_key: str = ""
     portainer_admin_password: str = ""  # пароль первого admin (5-секундное окно UI)
+    # Локальное окружение на самом сервере: без него в списке узлов Portainer
+    # видна пустота, хотя docker socket хоста под рукой. Создаётся через API
+    # по admin-паролю (Type=1 — «Docker Standalone»), контейнер-агент не нужен.
+    portainer_local_env: str = ""
     caddy_sites: list[str] = field(default_factory=list)  # "домен=http://upstream"
     caddy_portal: str = ""         # домен страницы с плитками сервисов
     caddy_portal_title: str = "Сервисы"  # заголовок страницы плиток
@@ -149,6 +153,7 @@ _OVERRIDES = (
     ("portainer_agent_edge_id", "portainer_agent_edge_id"),
     ("portainer_agent_edge_key", "portainer_agent_edge_key"),
     ("portainer_admin_password", "portainer_admin_password"),
+    ("portainer_local_env", "portainer_local_env"),
     ("caddy_sites", "caddy_site"),
     ("caddy_portal", "caddy_portal"),
     ("caddy_portal_title", "caddy_portal_title"),

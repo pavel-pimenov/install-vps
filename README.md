@@ -20,6 +20,7 @@
 | Версии образов | `--beszel-version`, `--portainer-version` | Образы запинены: hub и agent Beszel, сервер и агенты Portainer должны быть одной версии |
 | Контейнеры | `--portainer` | Portainer CE на отдельном домене `--portainer-domain` (UI 9443, туннель агентов через Caddy по 80) |
 | Управление с узла | `--portainer --portainer-mode agent --portainer-domain ДОМЕН --portainer-agent-edge-id ID --portainer-agent-edge-key KEY` | Только edge-агент: сам ходит в центральный Portainer, входящих портов не нужно |
+| Управление сервером из UI | `--portainer-local-env ИМЯ` | Локальное окружение на самом сервере (`Type=1`, docker socket хоста) — иначе в списке узлов пусто, хотя Docker под рукой |
 | Вход без пароля | `--beszel-user-creation` + `--beszel-disable-password-auth` | OAuth2 вместо пароля (провайдер настраивается в веб-UI Hub) |
 | HTTPS | `--caddy`, `--caddy-email` | Caddy в `network_mode: host`, сертификаты Let's Encrypt сами, HTTP → HTTPS |
 | Портал | `--caddy-portal ДОМЕН`, `--caddy-tile` | Страница с плитками сервисов; сервисы — под путями `/мониторинг`, `/thinpro` |
@@ -211,6 +212,18 @@ Portainer (Environments → Add environment → Edge Agent Standard). Join-то�
 интерфейсах, и закрывать его тогда нужно на стороне провайдера.
 Ключ и токен, уже настроенные на узле, при этом сохраняются — так узел
 переключается на новый хаб без ручного копирования секретов.
+
+Сервер сам по себе в списке узлов Portainer не появляется: для edge-узлов
+существуют агенты, а docker socket хоста остаётся не описанным. Лечится
+`--portainer-local-env ИМЯ` — установщик создаёт окружение через API
+(`Type=1`, «Docker Standalone», контейнер-агент не нужен), а повторный прогон
+находит его по имени и ничего не дублирует. Пароль для входа в API берётся с
+того же файла `/opt/portainer/admin-password`, что и `--admin-password-file`
+(на хосте он 0600, root), поэтому в JSON запроса он не попадает. Опция имеет
+смысл только для `portainer_mode = server` и требует
+`--portainer-admin-password`: без файла пароля установщик так и скажет, что
+окружение не создано. Если пароль админа меняли в UI, новый секрет лежит вне
+`install-vps` — узел добавляется вручную.
 
 ### Статика и уже занятое имя `caddy`
 

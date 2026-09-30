@@ -903,6 +903,100 @@ class PortainerTests(unittest.TestCase):
         self.assertIn("EDGE_ID/EDGE_KEY заданы в compose", script)
 
 
+class PortainerLocalEnvTests(unittest.TestCase):
+    """--portainer-local-env: сам сервер в списке узлов Portainer."""
+
+    def _cfg(self, **overrides) -> Config:
+        params = {
+            "portainer": True,
+            "portainer_mode": "server",
+            "portainer_domain": "portainer.example.com",
+            "portainer_admin_password": "Секрет-Пароль-42",
+            "portainer_local_env": "dc",
+        }
+        params.update(overrides)
+        return full_config(**params)
+
+    def test_env_created_via_api(self) -> None:
+        script = installer._portainer_script(self._cfg())
+        bash_check(script)
+        # Type=1 — «Docker Standalone»: docker socket хоста, агент не нужен
+        self.assertIn('\\"Name\\":\\"dc\\"', script)
+        self.assertIn('\\"Type\\":1', script)
+        self.assertIn("https://127.0.0.1:9443/api/auth", script)
+        # пароль берётся с файла 0600 на хосте, а не из конфига
+        self.assertIn("$SUDO cat /opt/portainer/admin-password", script)
+        self.assertIn("Authorization: Bearer $JWT_LOCAL", script)
+        # в JSON запроса идёт переменная, а не сам секрет
+        self.assertIn('\\"password\\":\\"$PW_LOCAL\\"', script)
+        # в compose секрета нет: он пишется на хост файлом 0600
+        self.assertNotIn("Секрет-Пароль-42", script.split("PORTAINER_EOF")[1])
+
+    def test_env_creation_in_install_and_verify(self) -> None:
+        cfg = self._cfg()
+        installer._validate(cfg)
+        host = FakeHost()
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            install(cfg, host)  # type: ignore[arg-type]
+        bash_check(host.script)
+        self.assertIn("/api/endpoints", host.script)
+        # фрагмент идёт после compose: контейнер к этому моменту поднят
+        self.assertLess(
+            host.script.index("PORTAINER_EOF"),
+            host.script.index("/api/endpoints"),
+        )
+        vhost = FakeHost()
+        verify(cfg, vhost)  # type: ignore[arg-type]
+        bash_check(vhost.script)
+        self.assertIn("/api/endpoints", vhost.script)
+        self.assertNotIn("apt-get install", vhost.script)
+
+    def test_no_env_fragment_by_default(self) -> None:
+        script = installer._portainer_script(
+            self._cfg(portainer_local_env="")
+        )
+        bash_check(script)
+        self.assertNotIn("/api/endpoints", script)
+
+    def test_env_absent_means_honest_warning(self) -> None:
+        # файла пароля нет — узел не создастся, и сказать об этом лучше
+        # прямо, чем рапортовать об успехе
+        script = installer._portainer_local_env_script(self._cfg())
+        bash_check(script)
+        self.assertIn("ВНИМАНИЕ: нет /opt/portainer/admin-password", script)
+        self.assertIn("не удалось войти в Portainer API", script)
+
+    def test_failed_auth_does_not_kill_install(self) -> None:
+        # под set -euo pipefail неудачный curl в $(...) роняет весь скрипт:
+        # нужен || true, иначе вместо предупреждения — молчаливый обрыв
+        # установки на середине
+        script = installer._portainer_local_env_script(self._cfg())
+        bash_check(script)
+        self.assertIn("""| sed -n 's/.*"jwt":"\\([^"]*\\)".*/\\1/p' || true)\"""", script)
+
+    def test_agent_node_rejected(self) -> None:
+        # у edge-агента своего API нет: опция молча ничего бы не сделала
+        with self.assertRaises(ValueError):
+            installer._validate(
+                self._cfg(
+                    portainer_mode="agent",
+                    portainer_agent_edge_id=EDGE_ID,
+                    portainer_agent_edge_key=EDGE_KEY,
+                )
+            )
+        with self.assertRaises(ValueError):
+            installer._validate(self._cfg(portainer=False))
+
+    def test_bad_env_name_rejected(self) -> None:
+        # имя подставляется в JSON и в grep: кавычка или пробел ломают
+        # и запрос, и проверку «уже есть»
+        for name in ('dc "x"', "моё окружение", "dc/x", ".hidden", "a" * 32):
+            with self.assertRaises(ValueError):
+                installer._validate(self._cfg(portainer_local_env=name))
+        # пустое имя — это «не просим», а не ошибка
+        installer._validate(self._cfg(portainer_local_env=""))
+
+
 class ForeignCaddyTests(unittest.TestCase):
     """Чужой контейнер caddy: установщик предупреждает, а не переименовывает."""
 
