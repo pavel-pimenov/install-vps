@@ -32,6 +32,10 @@ class Config:
     tools: list[str] = field(default_factory=list)  # утилиты вне репозиториев Ubuntu
     swap_size_mb: int = 512
     docker_source: str = "ubuntu"   # "ubuntu" — docker.io из архивов Ubuntu; "official" — docker-ce
+    # Держать версии docker-ce и его плагинов на текущих: apt-get upgrade сам
+    # новый major не тянет, но вручную проапгрейженный хост однажды уезжает
+    # посреди непротестированной связки. Пустой список — не запинивать ничего.
+    apt_hold_packages: list[str] = field(default_factory=list)
     beszel: bool = False            # поднять Beszel: хаб+агент (hub) либо только агент (agent)
     beszel_mode: str = "hub"        # "hub" — хаб и локальный агент, "agent" — только агент
     # для удалённого хаба: агент сам слушает порт, хаб ходит к нему
@@ -83,6 +87,11 @@ class Config:
     # по admin-паролю (Type=1 — «Docker Standalone»), контейнер-агент не нужен.
     portainer_local_env: str = ""
     caddy_sites: list[str] = field(default_factory=list)  # "домен=http://upstream"
+    # Файлы, которые обязаны отдаваться с зеркал: "домен=/путь/файла".
+    # Проверяются в --verify-only по HTTP-коду. Проба корня сайта ничего не
+    # говорит о содержимом: именно поэтому сломанный flylinkdc-search-engine.lua
+    # (404 из-за hide) держался месяцами, пока на него не пожаловался клиент.
+    caddy_must_serve: list[str] = field(default_factory=list)
     caddy_portal: str = ""         # домен страницы с плитками сервисов
     caddy_portal_title: str = "Сервисы"  # заголовок страницы плиток
     # единый вход на портал (HTTP basic): браузер спрашивает логин/пароль один
@@ -122,6 +131,7 @@ _OVERRIDES = (
     ("tools", "tools"),
     ("swap_size_mb", "swap_size_mb"),
     ("docker_source", "docker_source"),
+    ("apt_hold_packages", "apt_hold"),
     ("beszel", "beszel"),
     ("beszel_mode", "beszel_mode"),
     ("beszel_agent_allow", "beszel_agent_allow"),
@@ -155,6 +165,7 @@ _OVERRIDES = (
     ("portainer_admin_password", "portainer_admin_password"),
     ("portainer_local_env", "portainer_local_env"),
     ("caddy_sites", "caddy_site"),
+    ("caddy_must_serve", "caddy_must_serve"),
     ("caddy_portal", "caddy_portal"),
     ("caddy_portal_title", "caddy_portal_title"),
     ("portal_user", "portal_user"),

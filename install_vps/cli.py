@@ -67,6 +67,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--docker-source", choices=("ubuntu", "official"),
                    help="источник docker: ubuntu (docker.io, по умолчанию) "
                         "или official (docker-ce с download.docker.com)")
+    p.add_argument("--apt-hold", metavar="ПАКЕТ", action="append",
+                   help="запинить пакет на текущей версии (apt-mark hold), "
+                        "чтобы apt-get upgrade не утащил новый major: "
+                        "--apt-hold docker-ce (можно указать несколько раз)")
     p.add_argument("--verify-only", action="store_true",
                    help="только проверить наличие пакетов, ничего не ставить")
     _add_beszel_args(p)
@@ -150,6 +154,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="плитка портала: Мониторинг=/monitor=127.0.0.1:8090 "
                         "(префикс срезается), или Мониторинг=https://домен "
                         "для внешней ссылки (можно указать несколько раз)")
+    p.add_argument("--caddy-must-serve", metavar="DOMAIN=/PATH", action="append",
+                   help="файл, который обязан отдаваться: "
+                        "etc2.example.com=/flylinkdc-search-engine.lua — "
+                        "проверяется в --verify-only, 404 это ПРОБЛЕМА "
+                        "(можно указать несколько раз)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 

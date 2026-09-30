@@ -1,0 +1,58 @@
+# Шаблон хоста — копия боевого конфига БЕЗ секретов.
+# Порядок работы: cp config-templates/<хост>.toml config.<хост>.local.toml,
+# затем вставьте реальные значения вместо ВСТАВЬТЕ_СЕКРЕТ.
+# Готовый файл не коммитится (.gitignore: config.*.local.toml), поэтому
+# секреты в git не попадут — в отличие от этого шаблона.
+# Прогон: python3 -m install_vps -c config.<хост>.local.toml --verify-only
+
+# Стендовый конфиг для проверки раскатки с нуля: vpn.fly-server.ru
+# (Ubuntu 26.04, 1 vCPU, 453 МБ RAM, swapfile 512M уже в образе).
+# Боевой config.toml не трогаем.
+
+host = "vpn.fly-server.ru"
+user = "root"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+accept_new = true
+
+packages = ["nload", "htop", "btop", "mc", "git", "procps", "docker.io",
+            "docker-compose-v2", "fail2ban", "ncdu", "logrotate"]
+
+docker_source = "ubuntu"
+
+swap_size_mb = 512
+zram_size_mb = 256
+
+# проверяем и скачивание с GitHub + проверку sha256 с нуля
+tools = ["lazydocker", "bandwhich"]
+
+# ключ/токен агента выдаёт веб-UI Hub: на первом прогоне их нет,
+# установка закончится предупреждением — это и есть проверка
+beszel = true
+beszel_mode = "agent"
+beszel_port = 8090
+
+dozzle = true
+dozzle_port = 8082
+dozzle_path = "/logs"
+dozzle_user = "admin"
+
+journald_max_use = "100M"
+docker_log_max_size = "10m"
+docker_log_max_file = "3"
+
+caddy = true
+caddy_email = "pavel.pimenov@gmail.com"
+caddy_portal = "vpn.fly-server.ru"
+caddy_portal_title = "Сервисы"
+beszel_path = "/monitor"
+
+# пароль задан явно: перезаписывает users.yml (проверка смены пароля)
+dozzle_password = "ВСТАВЬТЕ_СЕКРЕТ"
+portal_user = "admin"
+portal_password = "ВСТАВЬТЕ_СЕКРЕТ"
+
+# Beszel: пары key/token получены скриптовой провижнинг-процедурой
+# (см. README, раздел про Beszel), в UI их копировать не нужно.
+beszel_agent_key = "ВСТАВЬТЕ_СЕКРЕТ"
+beszel_agent_token = "ВСТАВЬТЕ_СЕКРЕТ"

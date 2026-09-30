@@ -1,0 +1,46 @@
+# Шаблон хоста — копия боевого конфига БЕЗ секретов.
+# Порядок работы: cp config-templates/<хост>.toml config.<хост>.local.toml,
+# затем вставьте реальные значения вместо ВСТАВЬТЕ_СЕКРЕТ.
+# Готовый файл не коммитится (.gitignore: config.*.local.toml), поэтому
+# секреты в git не попадут — в отличие от этого шаблона.
+# Прогон: python3 -m install_vps -c config.<хост>.local.toml --verify-only
+
+# Узел парка: fi.fly-server.ru (157.228.156.42, Финляндия).
+# Debian 13 «trixie», 1 vCPU, 715 МБ RAM, 1.9 ГБ свободно (4.1 ГБ всего),
+# swapfile 767 МБ, ядро 6.12.41+deb13-amd64. IPv6 нет.
+# Узел занят AmneziaWG: контейнеры amnezia-telemt и amnezia-awg2, ufw не
+# установлен. Агент Beszel поднят 2026-09-30 (в исходящем режиме HUB_URL).
+#
+# ВАЖНО: install-vps нацелен на Ubuntu 24.04/26.04, здесь Debian — полный
+# прогон не выполнялся и не проверен. packages пустой намеренно: полный
+# прогон перезапустил бы docker и оборвал туннели AmneziaWG. Ручками на хосте
+# поставлен только docker-compose (Debian называет пакет docker-compose, версии
+# плагина, как в Ubuntu, в репозитории нет) — без него `docker compose` не
+# существует и фрагмент установки Beszel встал бы на этом.
+# Агент разворачивался штатным фрагментом installer._beszel_script (compose
+# /opt/beszel/docker-compose.yml), поэтому повторный install-vps перепишет его
+# тем же содержимым. Токен выдан скриптовой провижнинг-процедурой в хабе на dc.
+
+host = "fi.fly-server.ru"
+user = "root"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+accept_new = true
+
+packages = []
+swap_size_mb = 0
+zram_size_mb = 0
+
+# Мониторинг: только агент, провайдер может резать входящий 45876, поэтому
+# агент сам подключается к хабу на dc исходящим WebSocket.
+beszel = true
+beszel_mode = "agent"
+beszel_agent_port = 45876
+beszel_hub_url = "https://monitor.fly-server.ru"
+beszel_agent_key = "ВСТАВЬТЕ_СЕКРЕТ"
+beszel_agent_token = "ВСТАВЬТЕ_СЕКРЕТ"
+
+# Ничего не ставить поверх: узел занят AmneziaWG
+portainer = false
+dozzle = false
+caddy = false

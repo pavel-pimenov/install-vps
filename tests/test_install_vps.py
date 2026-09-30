@@ -19,7 +19,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from install_vps import installer  # noqa: E402
+from install_vps import (
+    installer,  # noqa: E402
+    lighttpd,  # noqa: E402
+)
 from install_vps.cli import _parser  # noqa: E402
 from install_vps.config import Config, apply_overrides, load_config  # noqa: E402
 from install_vps.installer import (  # noqa: E402
@@ -1185,6 +1188,36 @@ class StaticSiteTests(unittest.TestCase):
         self.assertIn("\t\thide .svn\n", script)
         self.assertIn("\t}\n", script)
 
+    def test_site_file_backed_up_before_write(self) -> None:
+        # файлы правили руками, откат после неудачного прогона иначе означал бы
+        # дописывание конфига заново
+        script = installer._caddy_sites_script(full_config(
+            caddy_sites=["www.example.com=file:/var/www"]))
+        bash_check(script)
+        self.assertIn("mkdir -p \"$backup\"", script)
+        self.assertIn("cp -a /opt/caddy/sites/www.example.com.caddy", script)
+        self.assertIn("/opt/caddy/sites.bak/$(date +%Y%m%d-%H%M%S)", script)
+
+    def test_site_write_skipped_when_unchanged(self) -> None:
+        # идемпотентный повторный прогон не должен плодить одинаковые копии
+        script = installer._caddy_sites_script(full_config(
+            caddy_sites=["www.example.com=file:/var/www"]))
+        self.assertIn("cmp -s", script)
+        self.assertIn("rm -f /opt/caddy/.sites-new/www.example.com.caddy", script)
+
+    def test_old_site_backups_pruned(self) -> None:
+        script = installer._caddy_sites_script(full_config(
+            caddy_sites=["www.example.com=file:/var/www"]))
+        self.assertIn(f"tail -n +{installer.SITE_BACKUP_KEEP + 1}", script)
+
+    def test_site_draft_outside_served_dir(self) -> None:
+        # sites/ смонтирован в контейнер и подключён import *.caddy — черновик
+        # туда класть нельзя
+        script = installer._caddy_sites_script(full_config(
+            caddy_sites=["www.example.com=file:/var/www"]))
+        self.assertIn("/opt/caddy/.sites-new/www.example.com.caddy", script)
+        self.assertNotIn("> /opt/caddy/sites/www.example.com.caddy.new", script)
+
     def test_lua_never_goes_to_hide(self) -> None:
         # hide у caddy не «скрывает из списка», а отдаёт 404 и на прямой
         # запрос: *.lua в hide отрезал flylinkdc-search-engine.lua, который
@@ -1626,6 +1659,49 @@ class SiteProbeTests(unittest.TestCase):
         self.assertNotIn("rm ", script)
         self.assertNotIn("rmdir", script)
 
+    def test_must_serve_probed_by_code(self) -> None:
+        # проба корня ничего не говорит о содержимом: сломанный lua держался
+        # месяцами, пока на него не пожаловался клиент
+        cfg = full_config(caddy_must_serve=["etc.example.com=/flylinkdc-search-engine.lua"])
+        script = installer._must_serve_check_script(cfg)
+        bash_check("check_must_serve() { :; }\n" + script)
+        self.assertIn('check_must_serve "etc.example.com" "/flylinkdc-search-engine.lua"', script)
+        self.assertIn('ПРОБЛЕМА', script)
+        self.assertIn('--resolve "$domain:443:127.0.0.1"', script)
+
+    def test_must_serve_empty_by_default(self) -> None:
+        self.assertEqual(installer._must_serve_check_script(full_config()), "")
+        self.assertEqual(
+            installer._must_serve_check_script(full_config(caddy=False, caddy_must_serve=["a.com=/x"])),
+            "",
+        )
+
+    def test_must_serve_bad_value_rejected(self) -> None:
+        for raw in (
+            "etc.example.com",             # без пути
+            "etc.example.com=",            # пустой путь
+            "=/x",                         # без домена
+            "etc.example.com=x",           # путь без ведущего слэша
+            "не домен=/x",                 # пробел в домене
+        ):
+            with self.assertRaises(ValueError):
+                installer._must_serve_check_script(full_config(caddy_must_serve=[raw]))
+
+    def test_must_serve_rejected_before_ssh(self) -> None:
+        # ошибка конфига не должна стоить подключения к хосту
+        host = FakeHost()
+        with self.assertRaises(ValueError):
+            verify(full_config(caddy_must_serve=["etc.example.com=x"]), host)  # type: ignore[arg-type]
+        self.assertEqual(host.script, "")
+
+    def test_must_serve_in_verify_script(self) -> None:
+        host = FakeHost()
+        cfg = full_config(caddy_must_serve=["etc.example.com=/a.lua"])
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            verify(cfg, host)  # type: ignore[arg-type]
+        bash_check(host.script)
+        self.assertIn('check_must_serve "etc.example.com" "/a.lua"', host.script)
+
     def test_no_junk_check_without_static_sites(self) -> None:
         cfg = self._cfg(caddy_sites=["shop.example.com=http://127.0.0.1:3000"])
         self.assertEqual(installer._static_junk_check(cfg), "")
@@ -1645,6 +1721,252 @@ class SiteProbeTests(unittest.TestCase):
     def test_no_probe_for_tls_based_proxy(self) -> None:
         cfg = self._cfg(caddy_sites=["api.example.com=https://backend:8443"])
         self.assertIn('check_site "api.example.com" proxy', installer._caddy_site_check_script(cfg))
+
+
+class AptHoldTests(unittest.TestCase):
+    """apt-mark hold: версии docker не должны уезжать major-обновлением."""
+
+    def test_hold_script_lists_versions(self) -> None:
+        script = installer.APT_HOLD.format(packages="docker-ce containerd.io")
+        bash_check(script)
+        self.assertIn('apt-mark hold "$pkg"', script)
+        self.assertIn("docker-ce containerd.io", script)
+        # версия печатается: hold без версии в журнале бесполезен
+        self.assertIn("dpkg-query -W", script)
+        self.assertIn("hold: $pkg ->", script)
+
+    def test_absent_package_is_warn_not_failure(self) -> None:
+        # set -e: hold несуществующего пакета не должен валить прогон
+        script = installer.APT_HOLD.format(packages="docker-ce")
+        self.assertIn("WARN:", script)
+        self.assertIn("dpkg -s", script)
+
+    def test_no_hold_script_by_default(self) -> None:
+        host = FakeHost()
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            install(full_config(), host)  # type: ignore[arg-type]
+        self.assertNotIn("apt-mark hold", host.script)
+
+    def test_hold_in_install_script(self) -> None:
+        host = FakeHost()
+        cfg = full_config(apt_hold_packages=["docker-ce", "containerd.io"])
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            install(cfg, host)  # type: ignore[arg-type]
+        bash_check(host.script)
+        self.assertIn("apt-mark hold", host.script)
+        self.assertIn("docker-ce containerd.io", host.script)
+
+    def test_hold_parsed_from_cli(self) -> None:
+        args = _parser().parse_args(["--apt-hold", "docker-ce", "--apt-hold", "containerd.io"])
+        cfg = apply_overrides(Config(), args)
+        self.assertEqual(cfg.apt_hold_packages, ["docker-ce", "containerd.io"])
+
+    def test_hold_survives_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text('apt_hold_packages = ["docker-ce"]\n', encoding="utf-8")
+            self.assertEqual(load_config(path).apt_hold_packages, ["docker-ce"])
+
+
+class DockerVersionTests(unittest.TestCase):
+    """Версии docker/compose должны быть видны в verify, а не прятаться."""
+
+    def _verify_script(self, cfg) -> str:
+        host = FakeHost()
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            verify(cfg, host)  # type: ignore[arg-type]
+        bash_check(host.script)
+        return host.script
+
+    def test_versions_reported(self) -> None:
+        script = self._verify_script(full_config())
+        self.assertIn("версии: docker", script)
+        self.assertIn("docker compose version", script)
+        # hold-статус рядом: без него непонятно, что удерживается от апгрейда
+        self.assertIn("apt-mark showhold", script)
+
+    def test_verify_survives_hosts_without_docker_hold(self) -> None:
+        # хост без apt-mark hold для docker: grep не находит ничего и отдаёт 1,
+        # а под set -euo pipefail это уронило бы весь verify (поймано на боевых
+        # хостах: ai/dc/vpn падали с кодом 1 без единой строки ПРОБЛЕМА)
+        script = self._verify_script(full_config())
+        self.assertIn("|| true)", script.split("apt-mark showhold")[1][:200])
+
+    def test_verify_script_runs_on_host_without_hold(self) -> None:
+        # настоящая проверка: фрагмент должен отработать на хосте без hold
+        proc = subprocess.run(
+            [BASH, "-c", "set -euo pipefail\n" + installer._docker_versions_check(full_config())],
+            text=True, capture_output=True, check=False,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/tmp"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_versions_reported_for_official_source(self) -> None:
+        # пакетов docker в cfg нет, но source=official его ставит — версии
+        # всё равно нужно показывать
+        script = self._verify_script(full_config(packages=["htop"], docker_source="official"))
+        self.assertIn("версии: docker", script)
+
+    def test_no_versions_without_docker(self) -> None:
+        self.assertEqual(
+            installer._docker_versions_check(full_config(packages=["htop", "git"])), ""
+        )
+
+    def test_hold_listed_in_report(self) -> None:
+        host = FakeHost()
+        cfg = full_config(apt_hold_packages=["docker-ce"])
+        with mock.patch.object(installer, "_codename", return_value="noble"):
+            install(cfg, host)  # type: ignore[arg-type]
+        self.assertIn("apt-mark showhold", host.script)
+
+
+class LighttpdAuditTests(unittest.TestCase):
+    """Аудит миграции lighttpd -> Caddy: потерянные правила должны быть видны.
+
+    На dc.fly-server.ru из lighttpd не переехали `url.access-deny` и
+    `static-file.exclude-extensions`: лежащий в дереве `upload.php` отдавался
+    как 200, пока это не заметил пользователь. Регрессия такого рода больше
+    не должна проходить молча — это и проверяет аудит.
+    """
+
+    # Реальный /etc/lighttpd/lighttpd.conf с dc, сокращённый до значимого
+    LTPD = """
+    server.document-root        = "/var/www"
+    dir-listing.activate = "enable"
+    $HTTP["url"] =~ "^/update($|/)" { server.dir-listing = "disable" }
+    $HTTP["url"] =~ "^/etc($|/)" { server.dir-listing = "disable" }
+    index-file.names := ( "index.php", "index.html", "index.lighttpd.html" )
+    url.access-deny             = ( "~", ".inc" )
+    static-file.exclude-extensions = ( ".php", ".pl", ".fcgi" )
+    #url.access-deny = ( "" )
+    """
+
+    DENY = ["*.inc", "*.php", "*.pl", "*.fcgi"]
+
+    def _sites(self, *specs: tuple[str, str, list[str]]) -> list:
+        return [(domain, root, opts) for domain, root, opts in specs]
+
+    def _rule(self, rules, name):
+        found = [r for r in rules if r.name == name]
+        self.assertEqual(len(found), 1, f"правило {name!r} ожидалось один раз")
+        return found[0]
+
+    def test_deny_lost_on_mirrors(self) -> None:
+        # deny есть только на сайте корня, зеркала его не унаследовали
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "index": ["index.html"]}),
+        ))
+        rule = self._rule(rules, "доступ к исполняемым файлам")
+        self.assertEqual(rule.level, lighttpd.WARN)
+        self.assertIn("etc.example.com", rule.hint)
+
+    def test_deny_lost_everywhere(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"]}),
+        ))
+        self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.LOST)
+
+    def test_deny_covered(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "deny": self.DENY}),
+        ))
+        self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.OK)
+
+    def test_deny_partial_extensions_flagged(self) -> None:
+        # закрыт только .php — остальное lighttpd тоже не отдавал
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"deny": ["*.php"]}),
+        ))
+        self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.LOST)
+
+    def test_deny_dot_php_form_accepted(self) -> None:
+        # '.php' в lighttpd и '*.php' в Caddy — одно правило, записанное иначе
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"deny": [".php", ".pl", ".fcgi", ".inc"]}),
+        ))
+        self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.OK)
+
+    def test_whole_site_browse_is_lost_rule(self) -> None:
+        # lighttpd гасил листинг для /etc и /update, а не для сайта целиком
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": []}),
+        ))
+        rule = self._rule(rules, "точечное гашение листинга")
+        self.assertEqual(rule.level, lighttpd.LOST)
+        self.assertIn("browse=/", rule.hint)
+
+    def test_scoped_browse_covers_disabled_paths(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"]}),
+            ("etc.example.com", "/var/www/etc", {"browse": []}),
+        ))
+        # зеркала со своим листингом — не потеря: пути стали отдельными доменами
+        self.assertEqual(self._rule(rules, "точечное гашение листинга").level, lighttpd.OK)
+
+    def test_index_default_needs_no_index_option(self) -> None:
+        # file_server сам ищет index.html, поэтому index= не обязателен
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
+        ))
+        rule = self._rule(rules, "индексные файлы")
+        self.assertEqual(rule.level, lighttpd.OK)
+        self.assertIn("index.php", rule.what)
+
+    def test_index_missing_is_warn(self) -> None:
+        rules = lighttpd.audit(self.LTPD.replace('"index.html"', '"home.html"'), self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
+        ))
+        self.assertEqual(self._rule(rules, "индексные файлы").level, lighttpd.WARN)
+
+    def test_commented_rule_not_counted(self) -> None:
+        # закомментированное правило никогда не действовало: ругаться не на что
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
+        ))
+        self.assertNotIn("spam", " ".join(r.what for r in rules))
+
+    def test_no_static_sites_is_warn_not_crash(self) -> None:
+        rules = lighttpd.audit(self.LTPD, [("api.example.com", "", {})])
+        self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.WARN)
+        self.assertEqual(self._rule(rules, "листинг каталогов").level, lighttpd.WARN)
+
+    def test_listing_lost(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"deny": self.DENY}),
+        ))
+        self.assertEqual(self._rule(rules, "листинг каталогов").level, lighttpd.LOST)
+
+    def test_report_marks_and_summary(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": []}),
+        ))
+        text = lighttpd.report(rules)
+        self.assertIn("ПОТЕРЯНО:", text)
+        self.assertIn("OK:", text)
+        self.assertIn("ИТОГО: потеряно правил", text)
+        self.assertIn("аудит lighttpd -> Caddy:", text)
+
+    def test_report_warn_summary(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
+            ("etc.example.com", "/var/www/etc", {"browse": []}),
+        ))
+        text = lighttpd.report(rules)
+        self.assertIn("WARN:", text)
+        self.assertNotIn("ПОТЕРЯНО:", text)
+        self.assertIn("ничего не потеряно", text)
+
+    def test_report_clean_summary(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "deny": self.DENY}),
+        ))
+        text = lighttpd.report(rules)
+        self.assertIn("все найденные правила перенесены", text)
 
 
 if __name__ == "__main__":

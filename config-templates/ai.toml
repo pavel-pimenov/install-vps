@@ -1,0 +1,33 @@
+# Шаблон хоста — копия боевого конфига БЕЗ секретов.
+# Порядок работы: cp config-templates/<хост>.toml config.<хост>.local.toml,
+# затем вставьте реальные значения вместо ВСТАВЬТЕ_СЕКРЕТ.
+# Готовый файл не коммитится (.gitignore: config.*.local.toml), поэтому
+# секреты в git не попадут — в отличие от этого шаблона.
+# Прогон: python3 -m install_vps -c config.<хост>.local.toml --verify-only
+
+# AI-узел (пользователь ppa, sudo по NOPASSWD).
+# Провайдер режет входящие высокие порты (45876), поэтому агент Beszel сам
+# подключается к хабу на dc исходящим WebSocket (beszel_hub_url). Порталы и
+# Caddy здесь не нужны — сайтов на ai нет.
+host = "ai.fly-server.ru"
+user = "ppa"
+sudo = true
+
+# Мониторинг: только агент, ключ/токен выдал скриптовый провижининг хаба
+beszel = true
+beszel_mode = "agent"
+beszel_agent_port = 45876
+beszel_hub_url = "https://monitor.fly-server.ru"
+beszel_agent_key = "ВСТАВЬТЕ_СЕКРЕТ"
+beszel_agent_token = "ВСТАВЬТЕ_СЕКРЕТ"
+
+# Portainer: edge-агент, окружение уже создано на сервере dc
+portainer = true
+portainer_mode = "agent"
+portainer_version = "2.45.1"
+portainer_agent_edge_id = "ВСТАВЬТЕ_UUID_ОКРУЖЕНИЯ"
+portainer_agent_edge_key = "ВСТАВЬТЕ_СЕКРЕТ"
+
+# Ничего не ставить поверх: узел занят mtproto-прокси
+caddy = false
+dozzle = false

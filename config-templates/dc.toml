@@ -1,0 +1,92 @@
+# Шаблон хоста — копия боевого конфига БЕЗ секретов.
+# Порядок работы: cp config-templates/<хост>.toml config.<хост>.local.toml,
+# затем вставьте реальные значения вместо ВСТАВЬТЕ_СЕКРЕТ.
+# Готовый файл не коммитится (.gitignore: config.*.local.toml), поэтому
+# секреты в git не попадут — в отличие от этого шаблона.
+# Прогон: python3 -m install_vps -c config.<хост>.local.toml --verify-only
+
+# Конфиг install-vps для ЦЕНТРАЛЬНОГО сервера dc.fly-server.ru.
+# Секреты — не коммитится (.gitignore: config.*.local.toml).
+
+host = "dc.fly-server.ru"
+user = "ppa"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+accept_new = true
+sudo = true
+
+packages = ['nload', 'htop', 'btop', 'mc', 'git', 'procps', 'docker.io', 'docker-compose-v2', 'fail2ban', 'ncdu', 'logrotate']
+docker_source = 'ubuntu'
+swap_size_mb = 512
+zram_size_mb = 256
+journald_max_use = '100M'
+docker_log_max_size = '10m'
+docker_log_max_file = 3
+
+# Beszel Hub (база переносится с dev) + агент самого dc.
+# Агент dc заработает после того, как в хабе добавят систему для dc
+# (Add system -> key/token) и install-vps перепрогонится с --beszel-key.
+beszel = true
+beszel_mode = "hub"
+beszel_port = 8090
+beszel_path = '/monitor'
+
+# Логи контейнеров
+dozzle = true
+dozzle_port = 8082
+dozzle_path = '/logs'
+dozzle_user = 'admin'
+
+# Portainer CE: UI на отдельном домене, туннель 8000 для edge-агентов.
+portainer = true
+portainer_mode = "server"
+portainer_domain = "portainer.fly-server.ru"
+portainer_admin_password = "ВСТАВЬТЕ_СЕКРЕТ"
+
+# HTTPS + портал
+caddy = true
+caddy_email = 'pavel.pimenov@gmail.com'
+caddy_portal = "dc.fly-server.ru"
+caddy_portal_title = "Сервисы"
+portal_user = 'admin'
+portal_password = "ВСТАВЬТЕ_СЕКРЕТ"
+caddy_domain = "monitor.fly-server.ru"
+caddy_tiles = [
+    "Мониторинг=https://monitor.fly-server.ru",
+    "Dev=https://dev.fly-server.ru",
+    "VPN=https://vpn.fly-server.ru",
+]
+# www.fly-server.ru раньше отдавал lighttpd из /var/www: 80/443 теперь у Caddy,
+# поэтому страница переезжает в него же статикой (сертификат получит сам).
+caddy_sites = [
+  "www.fly-server.ru=file:/var/www|browse=/install/|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  "etc.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+  "etc2.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+  "etc3.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+  "update.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+  "update2.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+  "update3.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+  "pvs-studio.fly-server.ru=file:/var/www/pvs-studio|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+]
+
+# Файлы, которые обязаны отдаваться. Проверяются в --verify-only:
+# 404 здесь = ПРОБЛЕМА, потому что клиент их не видит. Именно так держался
+# сломанный поиск FlyLinkDC — корни зеркал отдавали 200, а поисковый lua
+# был скрыт директивой hide и отдавался 404.
+caddy_must_serve = [
+  "etc.fly-server.ru=/flylinkdc-search-engine.lua",
+  "etc2.fly-server.ru=/flylinkdc-search-engine.lua",
+  "etc3.fly-server.ru=/flylinkdc-search-engine.lua",
+  "etc2.fly-server.ru=/flylinkdc-config-r6xx.xml",
+  "etc2.fly-server.ru=/flylinkdc-config-r5xx.xml",
+  "etc2.fly-server.ru=/flylinkdc-config-r4xx.xml",
+  "etc2.fly-server.ru=/strongdc-sqlite-config.xml",
+  "etc2.fly-server.ru=/isp-hub-list.txt",
+  "update.fly-server.ru=/readme.txt",
+  "www.fly-server.ru=/install/",
+]
+
+# Beszel: пары key/token получены скриптовой провижнинг-процедурой
+# (см. README, раздел про Beszel), в UI их копировать не нужно.
+beszel_agent_key = "ВСТАВЬТЕ_СЕКРЕТ"
+beszel_agent_token = "ВСТАВЬТЕ_СЕКРЕТ"

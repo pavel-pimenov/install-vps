@@ -245,7 +245,7 @@ compose — без неё сайт отдавал бы 404 на каждый ф�
 
 ```bash
 install-vps dc.fly-server.ru --caddy \
-  --caddy-site 'etc.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn' \
+  --caddy-site 'etc.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi' \
   --caddy-site 'www.fly-server.ru=file:/var/www|browse=/install/|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi,*~'
 ```
 
@@ -254,11 +254,59 @@ install-vps dc.fly-server.ru --caddy \
 `static-file.exclude-extensions`). Без `deny` Caddy отдаст лежащий в дереве
 `upload.php` как 200 — исполняемый код из публичного каталога.
 
+**`deny=` нужен на каждом сайте-статике, а не только на корне.** Правило
+lighttpd действовало на весь `server.document-root`, а зеркала `etc*`/`update*`
+после миграции стали отдельными доменами со своими корнями. Забытый `deny` на
+зеркале — это снова отдаваемый `.php`; на `dc` так и вышло, поймал
+`scripts/audit-lighttpd.sh`.
+
 - `browse` — листинг каталогов (можно указать только для путей: `browse=/install/`);
 - `index=файл,файл` — приоритет индексных файлов;
 - `hide=шаблон,…` — что не отдавать вовсе (скрывает файл и блокирует прямой запрос в Caddy);
 - `deny=шаблон,…` — какие файлы не отдавать с 403: у Caddy нет директивы
   `deny`, поэтому это matcher по пути и `respond 403`.
+
+### Аудит миграции: `scripts/audit-lighttpd.sh`
+
+Сверяет живой `/etc/lighttpd/lighttpd.conf` (он остаётся на хосте) с тем, что
+описано в `caddy_site`, и печатает, что **не перенесено**:
+
+```bash
+sh scripts/audit-lighttpd.sh -c config.dc.local.toml
+```
+
+```
+аудит lighttpd -> Caddy:
+  OK:       доступ к исполняемым файлам — lighttpd не отдавал .fcgi, .inc, .php, .pl
+  OK:       листинг каталогов — lighttpd: dir-listing = enable (каталоги видны)
+  OK:       точечное гашение листинга — lighttpd гасил dir-listing для /etc($|/)
+  OK:       индексные файлы — lighttpd: index-file.names = index.php, index.html
+  ИТОГО: все найденные правила перенесены
+```
+
+`ПОТЕРЯНО` — правило не перенесено вовсе, `WARN` — перенесено частично.
+Код возврата `1`, если есть потерянные правила. Ничего не меняет: это отчёт,
+а не «починить за меня».
+
+Особые случаи, которые разбираются отдельно, а не молча пропускаются:
+`index.php` и `index.lighttpd.html` переносить не нужно (первое lighttpd тоже
+не отдавал, второе генерировал сам lighttpd), а `browse` без пути на сайте
+корня считается потерей — lighttpd гасил листинг для `/etc` и `/update`
+точечно, значит открывать весь сайт нельзя.
+
+### `caddy_must_serve`: файлы, которые обязаны отдаваться
+
+```toml
+caddy_must_serve = [
+  "etc2.fly-server.ru=/flylinkdc-search-engine.lua",
+  "www.fly-server.ru=/install/",
+]
+```
+
+Проверяется в `--verify-only` по HTTP-коду, 404 — это `ПРОБЛЕМА`. Проба корня
+сайта ничего не говорит о содержимом: именно поэтому сломанный поиск
+FlyLinkDC (`hide *.lua`) держался месяцами, пока на него не пожаловался клиент.
+
 
 Значение — шаблон имени файла (буквы, цифры, `.`, `*`, `_`, `~`, `-`), а не путь:
 `../etc` и пробелы отклоняются, как и опции у сайта-прокси (там они бессмысленны).
@@ -308,6 +356,11 @@ lighttpd (`index-file.hide` влиял только на листинг). Поэ
   трёх уровней). `hide .svn` прячет их от клиента, но они продолжают лежать на
   диске: `.svn/wc.db` — вся история исходников, а сам каталог занимает сотни
   мегабайт. Проверка только предупреждает и ничего не удаляет.
+- **Файлы из `caddy_must_serve`** — то, что клиент обязан иметь возможность
+  скачать. 404 здесь `ПРОБЛЕМА`, а не `WARN`: файл недоступен, даже если корень
+  сайта отвечает 200.
+- **Версии docker/compose и apt-статус `hold`**: печатаются, чтобы расхождение
+  «хост на docker 29, а в заметках 26» не выяснялось при разборе инцидента.
 
 Расхождение версий и недоступный сайт — это `WARN`/`ПРОБЛЕМА`, а не падение:
 установщик ничего не чинит сам и не перезаписывает файл, который вы правите
@@ -321,6 +374,14 @@ install_vps/
   config.py     # Config + загрузка config.toml и слияние с флагами
   ssh.py        # RemoteHost: сборка команды ssh, потоковый запуск скрипта
   installer.py  # bash-шаблоны и генераторы (Caddy, Beszel, портал, утилиты)
+  lighttpd.py   # аудит миграции: что из lighttpd.conf не перенесено в Caddy
 tests/          # unittest: конфиг, валидация, bash -n по собранному скрипту
-scripts/check.sh   # локальная проверка: ruff + compileall + тесты
+scripts/check.sh        # локальная проверка: ruff + compileall + тесты
+scripts/verify-all.sh   # --verify-only по всем config.*.local.toml подряд
+scripts/audit-lighttpd.sh  # сверка lighttpd.conf с caddy_site на хосте
+config-templates/       # боевые конфиги без секретов (эталон структуры)
 ```
+
+`config-templates/<хост>.toml` — копии боевых `config.<хост>.local.toml` без
+паролей и ключей. Нужны, чтобы новый хост настраивался по образцу уже
+настроенного, а не с нуля; секреты в них быть не должно.

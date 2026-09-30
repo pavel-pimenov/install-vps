@@ -477,11 +477,41 @@ def _write_site_script(name: str, content: str) -> str:
 
     Содержимое не проходит через .format(), поэтому фигурные скобки
     Caddyfile экранировать не нужно.
+
+    Перед записью старый файл копируется в sites.bak/<метка>/: файлы правили
+    руками (правка Caddy, миграция lighttpd), и откат после неудачного прогона
+    иначе означал бы дописывание конфига заново. Копия делается только если
+    содержимое реально меняется — иначе каждый идемпотентный повторный прогон
+    плодил бы одинаковые копии. Хранятся последние {SITE_BACKUP_KEEP} срезов.
     """
+    # черновик пишем вне sites/: каталог смонтирован в контейнер и подключён
+    # через import /etc/caddy/sites/*.caddy, и мусор там не нужен
+    new_tmp = f"{CADDY_DIR}/.sites-new/{name}.caddy"
+    # черновик создаётся через $SUDO tee, то есть принадлежит root: снимать его
+    # без sudo нельзя, иначе на не-root хосте `rm` падает, а скрипт с set -e
+    # валит весь прогон на ровном месте
     return (
-        f"cat <<'CADDY_SITE_EOF' | $SUDO tee {CADDY_SITES_DIR}/{name}.caddy >/dev/null\n"
+        f"$SUDO mkdir -p {CADDY_DIR}/.sites-new\n"
+        f"$SUDO rm -f {new_tmp}\n"
+        f"cat <<'CADDY_SITE_EOF' | $SUDO tee {new_tmp} >/dev/null\n"
         f"{content}"
         "CADDY_SITE_EOF\n"
+        f"if [ -f {CADDY_SITES_DIR}/{name}.caddy ] && "
+        f"cmp -s {new_tmp} {CADDY_SITES_DIR}/{name}.caddy; then\n"
+        f"  $SUDO rm -f {new_tmp}\n"
+        "else\n"
+        f"  if [ -f {CADDY_SITES_DIR}/{name}.caddy ]; then\n"
+        f"    backup={CADDY_SITES_DIR}.bak/$(date +%Y%m%d-%H%M%S)\n"
+        f"    $SUDO mkdir -p \"$backup\"\n"
+        f"    $SUDO cp -a {CADDY_SITES_DIR}/{name}.caddy \"$backup/\" 2>/dev/null || true\n"
+        "  fi\n"
+        f"  $SUDO tee {CADDY_SITES_DIR}/{name}.caddy < {new_tmp} >/dev/null\n"
+        f"  $SUDO rm -f {new_tmp}\n"
+        "  # старые срезы: храним последние "
+        f"{SITE_BACKUP_KEEP}, старше — сносим\n"
+        f"  $SUDO ls -1dt {CADDY_SITES_DIR}.bak/*/ 2>/dev/null | tail -n +{SITE_BACKUP_KEEP + 1}"
+        f" | $SUDO xargs -r rm -rf\n"
+        "fi\n"
     )
 
 
@@ -1197,6 +1227,22 @@ echo "  unattended-upgrades: $(systemctl is-enabled unattended-upgrades.service 
 echo "  apt-daily-upgrade.timer: $(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null)"
 """
 
+APT_HOLD = r"""
+echo "==> apt-mark hold: версии, которые нельзя уводить major-обновлением"
+# Держать пакет — это apt-mark hold, а не пин в preferences: hold на конкретный
+# уже установленный пакет, и его снимает одна команда. Список печатаем, иначе
+# через месяц никто не вспомнит, что и зачем записано.
+for pkg in {packages}; do
+  if $SUDO dpkg -s "$pkg" >/dev/null 2>&1; then
+    $SUDO apt-mark hold "$pkg" >/dev/null
+    echo "  hold: $pkg -> $($SUDO dpkg-query -W -f='${{Version}}' "$pkg" 2>/dev/null)"
+  else
+    echo "  WARN: $pkg не установлен — hold пропущен"
+  fi
+done
+"""
+
+
 KEYRING_CLEANUP = r"""
 echo "==> чистим старые ядра (для малого места на диске)"
 CURRENT="$(uname -r)"
@@ -1250,6 +1296,10 @@ PORTAINER_ADMIN_SECRET = "/run/portainer-admin-password"  # путь внутр�
 CADDY_DIR = "/opt/caddy"
 CADDY_COMPOSE = "/opt/caddy/docker-compose.yml"
 CADDY_SITES_DIR = "/opt/caddy/sites"
+# копии прошлых версий сайтов: sites.bak/<метка времени>/<домен>.caddy
+CADDY_SITES_BACKUP_DIR = f"{CADDY_SITES_DIR}.bak"
+# сколько последних срезов храним — хватает для отката, но не съедает диск
+SITE_BACKUP_KEEP = 5
 # внутри контейнера sites/ примонтирован в /etc/caddy/sites — Caddyfile
 # пишется и читается уже по контейнерному пути
 CADDY_SITES_DIR_IN_CONTAINER = "/etc/caddy/sites"
@@ -1658,7 +1708,7 @@ for f in $($SUDO ls {sites_dir}/*.caddy 2>/dev/null); do
   [ -e "$f" ] || continue
   echo "  сайт: $(basename "$f" .caddy)"
 done
-{junk_check}{site_check}"""
+{junk_check}{site_check}{must_serve}"""
 
 VERIFY = r"""
 echo "==> проверка"
@@ -1690,6 +1740,7 @@ elif $SUDO docker compose version >/dev/null 2>&1; then
 else
   echo "  MISSING: docker-compose-v2"
 fi
+{docker_versions}
 if $SUDO swapon --show | grep -q '^/swapfile'; then
   echo "  OK: swap -> $($SUDO swapon --show)"
 else
@@ -1949,6 +2000,72 @@ def _caddy_site_check_script(cfg: Config) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _must_serve_check_script(cfg: Config) -> str:
+    """Проба файлов из `caddy_must_serve`: они обязаны отдаваться.
+
+    Проба корня сайта ничего не говорит о содержимом каталога, поэтому
+    «зеркало живо» и «нужный файл доступен» — разные вещи. Именно этой
+    разницей месяцами держался сломанный поиск FlyLinkDC: корни `etc*`
+    отдавали 200, а `flylinkdc-search-engine.lua` — 404 из-за `hide`.
+
+    404 здесь означает, что файл недоступен клиенту (нет на диске, скрыт
+    `hide`, не смонтирован каталог) — это ПРОБЛЕМА, а не WARN.
+    """
+    if not cfg.caddy or not cfg.caddy_must_serve:
+        return ""
+    lines = [
+        "check_must_serve() {",
+        '  domain="$1"; path="$2"',
+        "  code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' \\",
+        '    --resolve "$domain:443:127.0.0.1" "https://$domain$path" 2>/dev/null)',
+        '  case "$code" in',
+        "    2*|3*) echo \"  OK: https://$domain$path -> $code\" ;;",
+        '    000|"") echo "  WARN: https://$domain$path не ответил — Caddy не'
+        ' перечитал конфиг или каталог не смонтирован" ;;',
+        '    *) echo "  ПРОБЛЕМА: https://$domain$path -> $code: файл из'
+        ' caddy_must_serve недоступен (нет на диске или скрыт hide)" ;;',
+        "  esac",
+        "}",
+    ]
+    for raw in cfg.caddy_must_serve:
+        domain, sep, path = raw.partition("=")
+        domain, path = domain.strip(), path.strip()
+        if not sep or not domain or not path:
+            raise ValueError(
+                f"caddy_must_serve должен быть вида ДОМЕН=/ПУТЬ, а получено {raw!r}"
+            )
+        if not _HOSTNAME_RE.match(domain):
+            raise ValueError(f"Некорректный домен в caddy_must_serve: {domain!r}")
+        if not path.startswith("/"):
+            raise ValueError(f"Путь в caddy_must_serve должен начинаться с /: {raw!r}")
+        lines.append(f'check_must_serve "{domain}" "{path}"')
+    return "\n".join(lines) + "\n"
+
+
+def _docker_versions_check(cfg: Config) -> str:
+    """Показать установленные версии docker/compose и их apt-статус.
+
+    Версии образов запинены и проверяются, а версии самого docker раньше не были
+    видны нигде: расхождение «хост на docker 27, а в заметках 26» выяснялось
+    только при разборе инцидента. `apt-mark showhold` печатается рядом, чтобы
+    было видно, какие пакеты зафиксированы на текущих версиях.
+    """
+    if not any(p.startswith("docker") for p in cfg.packages) and cfg.docker_source != "official":
+        return ""
+    return r"""
+if command -v docker >/dev/null 2>&1; then
+  echo "  версии: docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?')"
+  $SUDO docker compose version 2>/dev/null | sed 's/^/  версии: /' || true
+  # `|| true` обязателен: grep без совпадений возвращает 1, и под
+  # `set -euo pipefail` пустой список hold уронил бы весь verify
+  HOLD="$($SUDO apt-mark showhold 2>/dev/null | grep -E '^docker' | tr '\n' ' ' || true)"
+  if [ -n "$HOLD" ]; then
+    echo "  hold: $HOLD"
+  fi
+fi
+"""
+
+
 def _static_junk_check(cfg: Config) -> str:
     """Предупредить о VCS-мусоре в отдаваемых каталогах.
 
@@ -2196,6 +2313,7 @@ def _validate(cfg: Config) -> list[Tile]:
     if cfg.caddy_email and not _EMAIL_RE.match(cfg.caddy_email):
         raise ValueError(f"Некорректный caddy_email: {cfg.caddy_email!r}")
     _caddy_sites_script(cfg, portal=bool(cfg.caddy_portal))
+    _must_serve_check_script(cfg)
     if cfg.caddy_portal:
         _portal_script(cfg, tiles)
     return tiles
@@ -2770,6 +2888,9 @@ def install(cfg: Config, host: RemoteHost) -> None:
     )
     script += LOGROTATE_COMPRESS
     script += UNATTENDED_UPGRADES
+    # apt-mark hold: без него apt-get upgrade уводит docker на новый major
+    script += APT_HOLD.format(packages=" ".join(cfg.apt_hold_packages)) \
+        if cfg.apt_hold_packages else ""
     script += KEYRING_CLEANUP
     if cfg.zram_size_mb > 0:
         script += ZRAM.format(size_mb=cfg.zram_size_mb)
@@ -2806,12 +2927,13 @@ def install(cfg: Config, host: RemoteHost) -> None:
             sites_dir=CADDY_SITES_DIR,
             site_check=_caddy_site_check_script(cfg),
             junk_check=_static_junk_check(cfg),
+            must_serve=_must_serve_check_script(cfg),
         )
         if cfg.caddy_portal:
             script += _portal_verify_script(cfg, tiles)
     if cfg.tools:
         script += _tools_verify_script(list(cfg.tools))
-    script += VERIFY
+    script += VERIFY.format(docker_versions=_docker_versions_check(cfg))
     host.run_script(script)
 
 
@@ -2833,10 +2955,11 @@ def verify(cfg: Config, host: RemoteHost) -> None:
             sites_dir=CADDY_SITES_DIR,
             site_check=_caddy_site_check_script(cfg),
             junk_check=_static_junk_check(cfg),
+            must_serve=_must_serve_check_script(cfg),
         )
         if cfg.caddy_portal:
             script += _portal_verify_script(cfg, tiles)
     if cfg.tools:
         script += _tools_verify_script(list(cfg.tools))
-    script += VERIFY
+    script += VERIFY.format(docker_versions=_docker_versions_check(cfg))
     host.run_script(script)

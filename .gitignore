@@ -222,3 +222,7 @@ __marimo__/
 config.local.toml
 # ...и любые per-host копии с секретами: config.dc.local.toml, config.ai.local.toml
 config.*.local.toml
+
+# Шаблоны хостов — копии боевых конфигов без секретов (лежат в git).
+# Готовые config.<хост>.local.toml с секретами перекрыты выше.
+config-templates/*.local.toml
