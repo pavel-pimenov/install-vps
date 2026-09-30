@@ -114,12 +114,15 @@ _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,30}$")
 # тег образа Beszel: hub и agent обязаны совпадать, «latest» недопустим
 _SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
-# опции сайта-статики в caddy_site: browse, index=..., hide=..., deny=...
+# опции сайта-статики в caddy_site: browse, browse=/путь/, index=..., hide=..., deny=...
 _STATIC_OPTION_RE = re.compile(
-    r"^(browse|index|hide|deny)(=([A-Za-z0-9.*_~!+-]+(,[A-Za-z0-9.*_~!+-]+)*)?)?$"
+    r"^(browse|index|hide|deny)(=([A-Za-z0-9./_*~!+-]+(,[A-Za-z0-9./_*~!+-]+)*)?)?$"
 )
 # шаблон имени файла для index/hide/deny: буквы, цифры и маски (* . ~ - _ ! +)
 _STATIC_ITEM_RE = re.compile(r"^[A-Za-z0-9.*_~!+-]+$")
+# путь URL для browse=/путь/: без масок, только буквы, цифры, точка, дефис,
+# подчёркивание и слэш — он попадает в matcher `path` готового Caddyfile
+_STATIC_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # адрес или CIDR: beszel_agent_allow открывает порт агента конкретным хостам
 _CIDR_RE = re.compile(
@@ -261,7 +264,7 @@ def _split_site(raw: str) -> tuple[str, str, str]:
 
 
 def _static_options(options: str) -> dict[str, list[str]]:
-    """Опции file_server из хвоста 'browse|index=a,b|hide=.svn'."""
+    """Опции file_server из хвоста 'browse|browse=/a/|index=a,b|hide=.svn'."""
     parsed: dict[str, list[str]] = {}
     for part in options.split("|"):
         chunk = part.strip()
@@ -272,12 +275,22 @@ def _static_options(options: str) -> dict[str, list[str]]:
         if not _STATIC_OPTION_RE.match(chunk):
             raise ValueError(
                 f"Неизвестная опция сайта-статики: {chunk!r}; поддерживаются "
-                "browse, index=файл,файл, hide=шаблон, deny=шаблон"
+                "browse, browse=/путь/, index=файл,файл, hide=шаблон, deny=шаблон"
             )
         name, _, values = chunk.partition("=")
         items = [item.strip() for item in values.split(",") if item.strip()]
         if name != "browse" and not items:
             raise ValueError(f"Опции {name} в caddy_site нуждаются в значениях: {chunk!r}")
+        if name == "browse" and items:
+            bad_paths = [item for item in items if not _STATIC_PATH_RE.match(item)]
+            if bad_paths:
+                raise ValueError(
+                    f"Недопустимые пути в browse= в caddy_site: {', '.join(bad_paths)}; "
+                    "нужен путь URL с ведущим слэшем и без масок — например "
+                    "browse=/install/"
+                )
+            parsed[name] = items
+            continue
         bad = [item for item in items if not _STATIC_ITEM_RE.match(item)]
         if bad:
             raise ValueError(
@@ -298,27 +311,66 @@ def _caddy_static_block(
     lighttpd) на Caddy: его содержимое переносится сайтом, а не выбрасывается.
 
     Опции повторяют то, что задавал lighttpd: `browse` — листинг каталогов,
-    `index` — приоритет индексных файлов, `hide` — что не показывать в
-    листинге, `deny` — какие файлы не отдавать вовсе (403). Без них сайт
-    получится голым file_server, и миграция тихо потеряет половину настроек.
+    `index` — приоритет индексных файлов, `hide` — что не отдавать вовсе,
+    `deny` — какие файлы не отдавать с 403. Без них сайт получится голым
+    file_server, и миграция тихо потеряет половину настроек.
+
+    Два отличия от lighttpd, на которых уже споткнулись:
+
+    - `hide` у Caddy не «скрывает из списка», а заставляет файловый сервер
+      делать вид, что файла нет: прямой запрос тоже получает 404. Поэтому
+      `*.lua` в `hide` однажды отрезал поиск FlyLinkDC — клиент грузит
+      flylinkdc-search-engine.lua с зеркала, — тогда как `index-file.hide` в
+      lighttpd фильтровал только листинг. Прячем служебное (`.svn`), а всё,
+      что качают клиенты, из `hide` убираем.
+    - `browse=/путь/` включает листинг только под указанными путями: под
+      lighttpd `dir-listing` гасили для `/update` и `/etc` точечно, и весь сайт
+      открывать нельзя — иначе списком станет и дерево торрентов. Директивы
+      `browse` у Caddy нет, поэтому это matcher и два `handle`: с листингом и
+      без, второй ловит всё остальное.
     """
     opts = options or {}
+
+    def file_server_lines(browse: bool, pad: str) -> list[str]:
+        inner = []
+        if opts.get("index"):
+            inner.append("index " + " ".join(opts["index"]))
+        if opts.get("hide"):
+            inner.append("hide " + " ".join(opts["hide"]))
+        head = "file_server browse" if browse else "file_server"
+        if not inner:
+            return [f"{pad}{head}"]
+        return [f"{pad}{head} {{"] + [f"{pad}\t{line}" for line in inner] + [f"{pad}}}"]
+
     lines = [f"\troot * {root}"]
-    if opts.get("deny"):
-        lines.append("\t@forbidden path " + " ".join(opts["deny"]))
-        lines.append("\trespond @forbidden 403")
-    inner = []
-    if opts.get("index"):
-        inner.append("index " + " ".join(opts["index"]))
-    if opts.get("hide"):
-        inner.append("hide " + " ".join(opts["hide"]))
-    head = "file_server browse" if "browse" in opts else "file_server"
-    if inner:
-        lines.append(f"\t{head} {{")
-        lines.extend(f"\t\t{line}" for line in inner)
+    deny = opts.get("deny")
+    paths = opts.get("browse") or []
+    if paths:
+        patterns = []
+        for raw_path in paths:
+            prefix = raw_path.rstrip("/")
+            # хвостовой слэш сам по себе в matcher не подставляется, поэтому
+            # и сам путь, и его подкаталоги перечисляем явно
+            patterns += [prefix, f"{prefix}/", f"{prefix}/*"]
+        if deny:
+            # `respond` упорядочен после `handle`, поэтому снаружи он не
+            # сработал бы вовсе — проверку запрета переносим внутрь блоков
+            lines.append("\t@forbidden path " + " ".join(deny))
+            lines.append("\thandle @forbidden {")
+            lines.append("\t\trespond 403")
+            lines.append("\t}")
+        lines.append("\t@listing path " + " ".join(patterns))
+        lines.append("\thandle @listing {")
+        lines.extend(file_server_lines(True, "\t\t"))
+        lines.append("\t}")
+        lines.append("\thandle {")
+        lines.extend(file_server_lines(False, "\t\t"))
         lines.append("\t}")
     else:
-        lines.append(f"\t{head}")
+        if deny:
+            lines.append("\t@forbidden path " + " ".join(deny))
+            lines.append("\trespond @forbidden 403")
+        lines.extend(file_server_lines("browse" in opts, "\t"))
     lines.append("\tencode gzip")
     return f"{domain} {{\n" + _access_log_block(cfg) + "\n".join(lines) + "\n}\n"
 
@@ -1606,7 +1658,7 @@ for f in $($SUDO ls {sites_dir}/*.caddy 2>/dev/null); do
   [ -e "$f" ] || continue
   echo "  сайт: $(basename "$f" .caddy)"
 done
-{site_check}"""
+{junk_check}{site_check}"""
 
 VERIFY = r"""
 echo "==> проверка"
@@ -1846,6 +1898,12 @@ def _caddy_site_check_script(cfg: Config) -> str:
     каталог смонтирован, но пуст; каталога нет вовсе; сертификат ещё не
     выпущен; Caddy не перечитал конфиг. Проба идёт через `--resolve` на
     127.0.0.1, поэтому внешний DNS и hairpin NAT провайдера не мешают.
+
+    404 у статики — не «WARN», а «ПРОБЛЕМА»: каталога с файлами без index-файла
+    и без листинга пользователь не видит вообще, а раньше такая поломка
+    проходила как заметка в конце лога. Отдельно проверяются пути из
+    `browse=/путь/`: корня может не быть, а листинг настроен именно на
+    подкаталог, и без такой пробы 404 на `/install/` остался бы незамеченным.
     """
     if not cfg.caddy:
         return ""
@@ -1859,19 +1917,64 @@ def _caddy_site_check_script(cfg: Config) -> str:
         '    000|"") echo "  WARN: https://$domain/ не ответил — сертификат не выпущен'
         ' или Caddy не перечитал конфиг" ;;',
         '    404) if [ "$kind" = static ]; then',
-        '           echo "  WARN: https://$domain/ -> 404: каталог пуст или нет index-файла"',
+        '           echo "  ПРОБЛЕМА: https://$domain/ -> 404: каталог пуст, нет'
+        ' index-файла и не задан листинг (browse или browse=/путь/)"',
         "         else",
         '           echo "  WARN: https://$domain/ -> 404: проверьте upstream"',
         "         fi ;;",
         '    *) echo "  WARN: https://$domain/ -> $code" ;;',
         "  esac",
         "}",
+        "check_browse() {",
+        '  domain="$1"; path="$2"',
+        "  code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \\",
+        '    --resolve "$domain:443:127.0.0.1" "https://$domain$path" 2>/dev/null)',
+        '  case "$code" in',
+        "    2*|3*) echo \"  OK: https://$domain$path -> $code (листинг)\" ;;",
+        '    000|"") echo "  WARN: https://$domain$path не ответил" ;;',
+        '    *) echo "  ПРОБЛЕМА: https://$domain$path -> $code: путь из browse='
+        '/путь/ не отдаётся — проверьте, что каталог есть и смонтирован" ;;',
+        "  esac",
+        "}",
     ]
     for raw in cfg.caddy_sites:
-        domain, upstream, _ = _split_site(raw)
+        domain, upstream, raw_options = _split_site(raw)
         kind = "static" if upstream.startswith(("file:", "static:")) else "proxy"
         lines.append(f'check_site "{domain}" {kind}')
+        if kind != "static":
+            continue
+        for browse_path in _static_options(raw_options).get("browse") or []:
+            path = browse_path if browse_path.endswith("/") else browse_path + "/"
+            lines.append(f'check_browse "{domain}" "{path}"')
     return "\n".join(lines) + "\n"
+
+
+def _static_junk_check(cfg: Config) -> str:
+    """Предупредить о VCS-мусоре в отдаваемых каталогах.
+
+    `hide .svn` закрывает прямой доступ, но не убирает мусор: `.svn/wc.db` —
+    вся история исходников, а на его месте каталоги занимают сотни мегабайт.
+    Проверка лёгкая (find с ограничением глубины) и ничего не удаляет.
+    """
+    if not cfg.caddy:
+        return ""
+    roots = _static_roots(cfg)
+    if not roots:
+        return ""
+    quoted = " ".join(f'"{root}"' for root in roots)
+    return (
+        f"for root in {quoted}; do\n"
+        '  [ -d "$root" ] || continue\n'
+        '  junk=$(find "$root" -maxdepth 3 -type d \\( -name .svn -o -name .git \\)'
+        " 2>/dev/null | head -5)\n"
+        '  if [ -n "$junk" ]; then\n'
+        '    echo "  ВНИМАНИЕ: служебные каталоги VCS в отдаваемом дереве $root:"\n'
+        '    echo "$junk" | sed "s/^/    /"\n'
+        '    echo "    hide .svn скрывает их от клиента, но они продолжают лежать'
+        ' на диске"\n'
+        "  fi\n"
+        "done\n"
+    )
 
 
 def _beszel_image_checks(cfg: Config) -> str:
@@ -2699,7 +2802,11 @@ def install(cfg: Config, host: RemoteHost) -> None:
             static_volumes=_static_volumes(roots),
             static_check=_static_roots_check(roots),
         )
-        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR, site_check=_caddy_site_check_script(cfg))
+        script += CADDY_VERIFY.format(
+            sites_dir=CADDY_SITES_DIR,
+            site_check=_caddy_site_check_script(cfg),
+            junk_check=_static_junk_check(cfg),
+        )
         if cfg.caddy_portal:
             script += _portal_verify_script(cfg, tiles)
     if cfg.tools:
@@ -2722,7 +2829,11 @@ def verify(cfg: Config, host: RemoteHost) -> None:
     if cfg.dozzle:
         script += _dozzle_verify_script(cfg)
     if cfg.caddy:
-        script += CADDY_VERIFY.format(sites_dir=CADDY_SITES_DIR, site_check=_caddy_site_check_script(cfg))
+        script += CADDY_VERIFY.format(
+            sites_dir=CADDY_SITES_DIR,
+            site_check=_caddy_site_check_script(cfg),
+            junk_check=_static_junk_check(cfg),
+        )
         if cfg.caddy_portal:
             script += _portal_verify_script(cfg, tiles)
     if cfg.tools:

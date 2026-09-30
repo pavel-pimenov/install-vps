@@ -1175,15 +1175,24 @@ class StaticSiteTests(unittest.TestCase):
         cfg = full_config(
             caddy_sites=[
                 "etc.example.com=file:/var/www/etc|browse"
-                "|index=index.html,index.lighttpd.html|hide=.svn,*.lua"
+                "|index=index.html,index.lighttpd.html|hide=.svn"
             ]
         )
         script = installer._caddy_sites_script(cfg)
         bash_check(script)
         self.assertIn("\tfile_server browse {\n", script)
         self.assertIn("\t\tindex index.html index.lighttpd.html\n", script)
-        self.assertIn("\t\thide .svn *.lua\n", script)
+        self.assertIn("\t\thide .svn\n", script)
         self.assertIn("\t}\n", script)
+
+    def test_lua_never_goes_to_hide(self) -> None:
+        # hide у caddy не «скрывает из списка», а отдаёт 404 и на прямой
+        # запрос: *.lua в hide отрезал flylinkdc-search-engine.lua, который
+        # клиент FlyLinkDC качает с зеркала для поиска по RSS
+        cfg = full_config(
+            caddy_sites=["etc.example.com=file:/var/www/etc|browse|hide=.svn"]
+        )
+        self.assertNotIn("lua", installer._caddy_sites_script(cfg))
 
     def test_browse_only_when_listed(self) -> None:
         # пустой список значений для browse — флаг, а не «листинг выключен»
@@ -1201,6 +1210,43 @@ class StaticSiteTests(unittest.TestCase):
         self.assertIn("\trespond @forbidden 403\n", script)
         # respond в порядке директив caddy идёт раньше file_server
         self.assertLess(script.index("respond @forbidden"), script.index("file_server"))
+
+    def test_browse_path_lists_only_that_path(self) -> None:
+        # lighttpd гасил dir-listing для /update и /etc, а /install/ оставлял:
+        # листинг включается точечно, весь сайт открывать нельзя
+        cfg = full_config(
+            caddy_sites=["www.example.com=file:/var/www|browse=/install/|hide=.svn"]
+        )
+        script = installer._caddy_sites_script(cfg)
+        bash_check(script)
+        self.assertIn("\t@listing path /install /install/ /install/*\n", script)
+        # блоки handle идут по порядку: сперва листинг, потом всё остальное
+        self.assertIn("\thandle @listing {\n\t\tfile_server browse {\n", script)
+        self.assertIn("\thandle {\n\t\tfile_server {\n", script)
+        self.assertNotIn("\tfile_server browse\n", script)
+        # hide нужен в обоих file_server, иначе .svn отдаётся мимо листинга
+        self.assertEqual(script.count("hide .svn"), 2)
+
+    def test_browse_path_keeps_deny_working(self) -> None:
+        # respond упорядочен после handle: снаружи он не сработал бы вовсе
+        cfg = full_config(
+            caddy_sites=["www.example.com=file:/var/www|browse=/install/|deny=*.inc"]
+        )
+        script = installer._caddy_sites_script(cfg)
+        bash_check(script)
+        self.assertIn("\thandle @forbidden {\n\t\trespond 403\n\t}\n", script)
+        self.assertLess(script.index("handle @forbidden"), script.index("handle @listing"))
+
+    def test_browse_path_bad_value_rejected(self) -> None:
+        for options in (
+            "browse=install/",   # без ведущего слэша
+            "browse=/a/*",       # маска: matcher собирает путь сам
+            "browse=/etc,c",     # без ведущего слэша
+        ):
+            with self.assertRaises(ValueError):
+                installer._caddy_sites_script(
+                    full_config(caddy_sites=[f"www.example.com=file:/var/www|{options}"])
+                )
 
     def test_options_rejected_on_proxy_site(self) -> None:
         with self.assertRaises(ValueError):
@@ -1535,13 +1581,58 @@ class SiteProbeTests(unittest.TestCase):
 
     def test_static_404_mentions_index(self) -> None:
         script = installer._caddy_site_check_script(self._cfg())
-        self.assertIn("каталог пуст или нет index-файла", script)
+        self.assertIn("каталог пуст, нет index-файла и не задан листинг", script)
         self.assertIn("проверьте upstream", script)
         # нулевой код = TLS/caddy, а не 404
         self.assertIn('000|"")', script)
 
+    def test_static_404_is_problem_not_warn(self) -> None:
+        # 404 у статики значит, что пользователь не видит сайт вообще:
+        # раньше такая поломка проходила как WARN в конце лога
+        script = installer._caddy_site_check_script(self._cfg())
+        static_branch = script.split('404) if [ "$kind" = static ]; then')[1].split("else")[0]
+        self.assertIn("ПРОБЛЕМА", static_branch)
+        self.assertNotIn("WARN", static_branch)
+        # у прокси 404 остаётся WARN: там дело не в файлах
+        proxy_branch = script.split("else")[1].split("fi ;;")[0]
+        self.assertIn("WARN", proxy_branch)
+
+    def test_browse_path_probed_separately(self) -> None:
+        # корень может быть без index-файла, а листинг настроен на
+        # подкаталог: без отдельной пробы 404 на /install/ не заметить
+        cfg = self._cfg(caddy_sites=["www.example.com=file:/var/www|browse=/install/"])
+        script = installer._caddy_site_check_script(cfg)
+        bash_check("check_site() { :; }\ncheck_browse() { :; }\n" + script)
+        self.assertIn('check_browse "www.example.com" "/install/"', script)
+        self.assertIn("ПРОБЛЕМА", script)
+
+    def test_browse_probe_ignores_plain_browse(self) -> None:
+        # у сайта с обычным browse путей нет — вызов пробы не нужен
+        script = installer._caddy_site_check_script(self._cfg())
+        self.assertNotIn('check_browse "', script)
+
+    def test_browse_probe_skipped_for_proxy(self) -> None:
+        # у прокси путей из browse не бывает: опции запрещены ещё в _validate
+        cfg = self._cfg(caddy_sites=["api.example.com=https://backend:8443"])
+        self.assertNotIn('check_browse "', installer._caddy_site_check_script(cfg))
+
+    def test_vcs_junk_warned_in_served_tree(self) -> None:
+        # hide .svn скрывает мусор от клиента, но он лежит на диске
+        script = installer._static_junk_check(self._cfg())
+        bash_check(script)
+        self.assertIn("-name .svn -o -name .git", script)
+        self.assertIn('for root in "/var/www/etc"', script)
+        # проверка ничего не удаляет — молчаливое rm -r в verify недопустимо
+        self.assertNotIn("rm ", script)
+        self.assertNotIn("rmdir", script)
+
+    def test_no_junk_check_without_static_sites(self) -> None:
+        cfg = self._cfg(caddy_sites=["shop.example.com=http://127.0.0.1:3000"])
+        self.assertEqual(installer._static_junk_check(cfg), "")
+
     def test_no_probe_without_caddy(self) -> None:
         self.assertEqual(installer._caddy_site_check_script(self._cfg(caddy=False)), "")
+        self.assertEqual(installer._static_junk_check(self._cfg(caddy=False)), "")
 
     def test_probe_in_verify_script(self) -> None:
         host = FakeHost()
@@ -1549,6 +1640,7 @@ class SiteProbeTests(unittest.TestCase):
             verify(self._cfg(), host)  # type: ignore[arg-type]
         bash_check(host.script)
         self.assertIn('check_site "etc.example.com" static', host.script)
+        self.assertIn("служебные каталоги VCS", host.script)
 
     def test_no_probe_for_tls_based_proxy(self) -> None:
         cfg = self._cfg(caddy_sites=["api.example.com=https://backend:8443"])
