@@ -1975,7 +1975,8 @@ class LighttpdAuditTests(unittest.TestCase):
         # deny есть только на сайте корня, зеркала его не унаследовали
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
-            ("etc.example.com", "/var/www/etc", {"browse": [], "index": ["index.html"]}),
+            ("etc.example.com", "/var/www/etc",
+             {"browse": [], "index": ["index.html"], "legacy": ["/etc"]}),
         ))
         rule = self._rule(rules, "доступ к исполняемым файлам")
         self.assertEqual(rule.level, lighttpd.WARN)
@@ -1990,7 +1991,8 @@ class LighttpdAuditTests(unittest.TestCase):
     def test_deny_covered(self) -> None:
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
-            ("etc.example.com", "/var/www/etc", {"browse": [], "deny": self.DENY}),
+            ("etc.example.com", "/var/www/etc",
+             {"browse": [], "deny": self.DENY, "legacy": ["/etc"]}),
         ))
         self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.OK)
 
@@ -2012,7 +2014,7 @@ class LighttpdAuditTests(unittest.TestCase):
         # lighttpd гасил листинг для /etc и /update, а не для сайта целиком
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": []}),
-            ("etc.example.com", "/var/www/etc", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "legacy": ["/etc"]}),
         ))
         rule = self._rule(rules, "точечное гашение листинга")
         self.assertEqual(rule.level, lighttpd.LOST)
@@ -2021,7 +2023,7 @@ class LighttpdAuditTests(unittest.TestCase):
     def test_scoped_browse_covers_disabled_paths(self) -> None:
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": ["/install/"]}),
-            ("etc.example.com", "/var/www/etc", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "legacy": ["/etc"]}),
         ))
         # зеркала со своим листингом — не потеря: пути стали отдельными доменами
         self.assertEqual(self._rule(rules, "точечное гашение листинга").level, lighttpd.OK)
@@ -2091,7 +2093,7 @@ class LighttpdAuditTests(unittest.TestCase):
     def test_report_marks_and_summary(self) -> None:
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": []}),
-            ("etc.example.com", "/var/www/etc", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "legacy": ["/etc"]}),
         ))
         text = lighttpd.report(rules)
         self.assertIn("ПОТЕРЯНО:", text)
@@ -2102,7 +2104,7 @@ class LighttpdAuditTests(unittest.TestCase):
     def test_report_warn_summary(self) -> None:
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
-            ("etc.example.com", "/var/www/etc", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "legacy": ["/etc"]}),
         ))
         text = lighttpd.report(rules)
         self.assertIn("WARN:", text)
@@ -2112,11 +2114,94 @@ class LighttpdAuditTests(unittest.TestCase):
     def test_report_clean_summary(self) -> None:
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": ["/install/"], "deny": self.DENY}),
-            ("etc.example.com", "/var/www/etc", {"browse": [], "deny": self.DENY}),
+            ("etc.example.com", "/var/www/etc",
+             {"browse": [], "deny": self.DENY, "legacy": ["/etc"]}),
         ))
         text = lighttpd.report(rules)
         self.assertIn("все найденные правила перенесены", text)
 
+    # Реальный блок mod_setenv с dc: заголовки заданы списком через =>
+    LTPD_SETENV = """
+    server.document-root        = "/var/www"
+    server.modules += ("mod_setenv",)
+    $HTTP["url"] =~ "^/pvs-studio/" {
+        setenv.add-response-header = (
+            "Cache-Control" => "no-store, no-cache, must-revalidate",
+            "Pragma" => "no-cache",
+        )
+    }
+    """
+
+    SETENV = [("", "Cache-Control", "no-store, no-cache, must-revalidate"),
+              ("", "Pragma", "no-cache")]
+
+    def test_mod_setenv_parsed_from_multiline_block(self) -> None:
+        """Пары заголовков лежат на своих строках — построчный разбор их не видел."""
+        found = lighttpd._setenv_headers(self.LTPD_SETENV)
+        self.assertEqual(found, [
+            ("/pvs-studio", "Cache-Control: no-store, no-cache, must-revalidate"),
+            ("/pvs-studio", "Pragma: no-cache"),
+        ])
+
+    def test_headers_lost_without_header_option(self) -> None:
+        rules = lighttpd.audit(self.LTPD_SETENV, self._sites(
+            ("pvs.example.com", "/var/www/pvs-studio", {"browse": []}),
+        ))
+        rule = self._rule(rules, "заголовки mod_setenv")
+        self.assertEqual(rule.level, lighttpd.LOST)
+        self.assertIn("header=", rule.hint)
+
+    def test_site_wide_header_covers(self) -> None:
+        rules = lighttpd.audit(self.LTPD_SETENV, self._sites(
+            ("pvs.example.com", "/var/www/pvs-studio",
+             {"browse": [], "header": self.SETENV}),
+        ))
+        self.assertEqual(self._rule(rules, "заголовки mod_setenv").level, lighttpd.OK)
+
+    def test_path_scoped_header_covers_whole_docroot_site(self) -> None:
+        """На www путь /pvs-studio/ обслуживается, нужен path-совместимый header."""
+        rules = lighttpd.audit(self.LTPD_SETENV, self._sites(
+            ("www.example.com", "/var/www", {"browse": [],
+             "header": [("/pvs-studio", "Cache-Control",
+                          "no-store, no-cache, must-revalidate"),
+                        ("/pvs-studio", "Pragma", "no-cache")]}),
+        ))
+        self.assertEqual(self._rule(rules, "заголовки mod_setenv").level, lighttpd.OK)
+
+    def test_header_not_required_on_unrelated_mirror(self) -> None:
+        """На зеркале /var/www/etc запроса /pvs-studio/ не бывает.
+
+        Правило остаётся в отчёте как OK, а не исчезает: так видно, что
+        заголовок рассмотрен и «не нужен здесь», а не «не заметен».
+        """
+        rules = lighttpd.audit(self.LTPD_SETENV, self._sites(
+            ("etc.example.com", "/var/www/etc", {"browse": [], "legacy": ["/etc"]}),
+        ))
+        self.assertEqual(self._rule(rules, "заголовки mod_setenv").level, lighttpd.OK)
+
+    def test_legacy_prefix_lost_on_nested_root(self) -> None:
+        """Ровно та поломка, из-за которой отвалился поиск FlyLinkDC."""
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": []}),
+        ))
+        rule = self._rule(rules, "legacy-префиксы URL")
+        self.assertEqual(rule.level, lighttpd.LOST)
+        self.assertIn("legacy=/etc", rule.hint)
+
+    def test_legacy_prefix_ok_when_present(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": []}),
+            ("etc.example.com", "/var/www/etc", {"browse": [], "legacy": ["/etc"]}),
+        ))
+        self.assertEqual(self._rule(rules, "legacy-префиксы URL").level, lighttpd.OK)
+
+    def test_no_legacy_rule_when_roots_equal_doc_root(self) -> None:
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("www.example.com", "/var/www", {"browse": []}),
+        ))
+        names = [r.name for r in rules]
+        self.assertNotIn("legacy-префиксы URL", names)
 
 if __name__ == "__main__":
     unittest.main()

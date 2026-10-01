@@ -237,6 +237,126 @@ def _rule_index(lines: list[str], sites: list[tuple[str, str, dict]]) -> Rule | 
                 + "): каталог покажет листинг вместо индекса — " + ", ".join(without))
 
 
+def _denied_patterns(lines: list[str]) -> list[str]:
+    """Не-расширенные шаблоны url.access-deny — например «~» (баккапы)."""
+    found: set[str] = set()
+    for line in lines:
+        m = re.search(r'url\.access-deny\s*=\s*\(?\s*(.+?)\s*\)?$', line)
+        if m:
+            found |= {tok for tok in re.findall(r'"([^"]+)"', m.group(1))
+                      if not tok.startswith(".") and not tok.startswith("*")}
+    return sorted(found)
+
+
+def _legacy_prefix(root: str, doc_root: str) -> str:
+    """URL-префикс, по которому lighttpd отдавал поддерево сайта.
+
+    При `document-root = /var/www` клиент ходил по `/etc/файл`, а сайт в Caddy
+    с корнем `/var/www/etc` ждёт `/файл`: без `legacy=/etc` запрос уезжал в
+    404. Именно так отвалился поиск FlyLinkDC — его собственный конфиг внутри
+    зеркала ссылается на `http://etc.fly-server.ru/etc/xxx-block.txt`.
+    """
+    if not doc_root or not root or root == doc_root:
+        return ""
+    if not root.startswith(doc_root + "/"):
+        return ""
+    return "/" + root.removeprefix(doc_root + "/").partition("/")[0]
+
+
+def _opts_by_domain(sites: list[tuple[str, str, dict]]) -> dict[str, dict]:
+    return {domain: opts for domain, _root, opts in sites}
+
+
+def _rule_legacy_prefix(sites: list[tuple[str, str, dict]], doc_root: str) -> Rule | None:
+    """Вложенные корни требуют legacy= с префиксом пути."""
+    needed = [(domain, _legacy_prefix(root, doc_root))
+              for domain, root, _opts in sites]
+    needed = [(domain, prefix) for domain, prefix in needed if prefix]
+    if not needed:
+        return None
+    what = f"lighttpd отдавал {doc_root} целиком, клиенты ходят по /<подкаталог>/файл"
+    lookup = _opts_by_domain(sites)
+    uncovered = [(domain, prefix) for domain, prefix in needed
+                 if prefix not in (lookup.get(domain, {}).get("legacy") or ())]
+    if not uncovered:
+        return Rule("legacy-префиксы URL", what, OK)
+    return Rule(
+        "legacy-префиксы URL", what, LOST,
+        "добавьте к caddy_site: "
+        + ", ".join(f"{d} |legacy={p}" for d, p in uncovered),
+    )
+
+
+_SETENV_BLOCK_RE = re.compile(
+    r'\$HTTP\["url"\]\s*=~\s*"\^(/[^"]*?)/?"\s*\{(.*?)\}', re.DOTALL
+)
+_SETENV_PAIR_RE = re.compile(r'"([^"]+)"\s*(?:=>|=)\s*"([^"]*)"')
+
+
+def _setenv_headers(text: str) -> list[tuple[str, str]]:
+    """Заголовки, которые lighttpd проставлял через mod_setenv.
+
+    Блок бывает многострочным и с разными формами записи:
+
+        $HTTP["url"] =~ "^/pvs-studio/" {
+            setenv.add-response-header = (
+                "Cache-Control" => "no-store, no-cache, must-revalidate",
+                "Pragma" => "no-cache",
+            )
+        }
+
+    Возвращает пары (путь-префикс, "Name: value"). Разбираем блок целиком:
+    пары лежат на своих строках, и построчное сопоставление их не видело —
+    проверка молчала бы, а заголовки на хосте не появились бы.
+    """
+    out: list[tuple[str, str]] = []
+    for match in _SETENV_BLOCK_RE.finditer(text):
+        prefix = "/" + match.group(1).strip("/")
+        if not match.group(2).strip():
+            continue  # блок без setenv — не заголовки
+        for field, value in _SETENV_PAIR_RE.findall(match.group(2)):
+            out.append((prefix, f"{field}: {value}"))
+    return out
+
+
+def _rule_headers(lines: list[str], text: str, sites: list[tuple[str, str, dict]],
+                  doc_root: str) -> Rule | None:
+    """mod_setenv lighttpd -> header= в caddy_site."""
+    wanted = _setenv_headers(text)
+    if not wanted:
+        return None
+    what = "lighttpd проставлял: " + ", ".join(sorted({h for _, h in wanted}))
+    lookup = _opts_by_domain(sites)
+    uncovered = []
+    for domain, root, _opts in sites:
+        if not _under_root(root, doc_root):
+            continue
+        # условие lighttpd касалось пути, а не домена: на зеркале /var/www/etc
+        # запроса /pvs-studio/ не бывает, и требовать там заголовок — шум.
+        # Правило действует там, где этот путь реально обслуживается: на сайте
+        # самого document-root (всё дерево) и на сайте с таким же legacy-корнем.
+        legacy = _legacy_prefix(root, doc_root)
+        relevant = [(prefix, header) for prefix, header in wanted
+                    if root == doc_root or prefix == legacy]
+        if not relevant:
+            continue
+        # опции хранят тройки (путь, поле, значение); сайт покрывает условие
+        # либо заголовком на весь сайт, либо path-совместимым
+        covered = any(
+            (not scope or scope == prefix)
+            and f"{field}: {value}" == header
+            for scope, field, value in (lookup.get(domain, {}).get("header") or ())
+            for prefix, header in relevant
+        )
+        if not covered:
+            uncovered.append(domain)
+    if not uncovered:
+        return Rule("заголовки mod_setenv", what, OK)
+    return Rule("заголовки mod_setenv", what, LOST,
+                "добавьте |header=<Name: value> (или |header=/путь/*=<Name: value>) "
+                "к caddy_site: " + ", ".join(uncovered))
+
+
 def audit(text: str, sites: list[tuple[str, str, dict[str, list[str]]]]) -> list[Rule]:
     """Сверяет правила lighttpd с настройкой сайтов.
 
@@ -252,6 +372,8 @@ def audit(text: str, sites: list[tuple[str, str, dict[str, list[str]]]]) -> list
     static = [(domain, root, opts) for domain, root, opts in sites if root]
     checks = (
         _rule_deny(lines, static, doc_root),
+        _rule_legacy_prefix(static, doc_root),
+        _rule_headers(lines, text, static, doc_root),
         _rule_listing(lines, static),
         _rule_scoped_listing(lines, static, doc_root),
         _rule_index(lines, static),

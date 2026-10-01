@@ -62,15 +62,26 @@ caddy_tiles = [
 ]
 # www.fly-server.ru раньше отдавал lighttpd из /var/www: 80/443 теперь у Caddy,
 # поэтому страница переезжает в него же статикой (сертификат получит сам).
+# legacy=/etc и legacy=/update обязательны: прежний document-root lighttpd был
+# /var/www, поэтому клиенты ходят по /etc/файл и /update/файл. Сайты вынесены
+# на отдельные домены с корнем /var/www/etc, и без стрипа префикса
+# /etc/flylinkdc-config-r6xx.xml отдавал 404 — а сам конфиг FlyLinkDC внутри
+# зеркала ссылается на http://etc.fly-server.ru/etc/xxx-block.txt.
+# Запрет *~ (url.access-deny = ("~", ".inc")) у lighttpd был глобальным,
+# поэтому deny= на каждом зеркале, а не только на www.
 caddy_sites = [
-  "www.fly-server.ru=file:/var/www|browse=/install/|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi,*~",
-  "etc.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
-  "etc2.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
-  "etc3.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
-  "update.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
-  "update2.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
-  "update3.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
-  "pvs-studio.fly-server.ru=file:/var/www/pvs-studio|index=index.html|hide=.svn|deny=*.inc,*.php,*.pl,*.fcgi",
+  # mod_setenv lighttpd действовал на путь на ЛЮБОМ домене, поэтому и тут
+  # запрет кэша нужен под /pvs-studio/, а не на весь сайт.
+  "www.fly-server.ru=file:/var/www|browse=/install/|hide=.svn|header=/pvs-studio/*=Cache-Control: no-store, no-cache, must-revalidate|header=/pvs-studio/*=Pragma: no-cache|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  "etc.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|legacy=/etc|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  "etc2.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|legacy=/etc|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  "etc3.fly-server.ru=file:/var/www/etc|browse|index=index.html|hide=.svn|legacy=/etc|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  "update.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|legacy=/update|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  "update2.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|legacy=/update|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  "update3.fly-server.ru=file:/var/www/update|browse|index=index.html|hide=.svn|legacy=/update|deny=*.inc,*.php,*.pl,*.fcgi,*~",
+  # mod_setenv lighttpd запрещал кэшировать /pvs-studio/ — без этого браузер
+  # мог удержать старый список обновлений.
+  "pvs-studio.fly-server.ru=file:/var/www/pvs-studio|index=index.html|hide=.svn|legacy=/pvs-studio|header=Cache-Control: no-store, no-cache, must-revalidate|header=Pragma: no-cache|deny=*.inc,*.php,*.pl,*.fcgi,*~",
 ]
 
 # Файлы, которые обязаны отдаваться. Проверяются в --verify-only:
@@ -79,6 +90,15 @@ caddy_sites = [
 # был скрыт директивой hide и отдавался 404.
 caddy_must_serve = [
   "etc.fly-server.ru=/flylinkdc-search-engine.lua",
+  # те же файлы по legacy-пути /etc/...: именно так к ним ходит клиент
+  "etc.fly-server.ru=/etc/flylinkdc-search-engine.lua",
+  "etc.fly-server.ru=/etc/flylinkdc-config-r6xx.xml",
+  "etc.fly-server.ru=/etc/flylinkdc-config-r5xx.xml",
+  "etc.fly-server.ru=/etc/flylinkdc-config-r4xx.xml",
+  "etc.fly-server.ru=/etc/strongdc-sqlite-config.xml",
+  "etc.fly-server.ru=/etc/isp-hub-list.txt",
+  "etc2.fly-server.ru=/etc/flylinkdc-config-r6xx.xml",
+  "update.fly-server.ru=/update/readme.txt",
   "etc2.fly-server.ru=/flylinkdc-search-engine.lua",
   "etc3.fly-server.ru=/flylinkdc-search-engine.lua",
   "etc2.fly-server.ru=/flylinkdc-config-r6xx.xml",

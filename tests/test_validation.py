@@ -811,8 +811,8 @@ class MigrationConsistencyTests(unittest.TestCase):
             caddy=True,
             caddy_sites=[
                 f"www.fly-server.ru=file:/var/www|browse=/install/|{self.DENY}",
-                f"etc.fly-server.ru=file:/var/www/etc|browse|{self.DENY}",
-                f"update.fly-server.ru=file:/var/www/update|browse|{self.DENY}",
+                f"etc.fly-server.ru=file:/var/www/etc|browse|legacy=/etc|{self.DENY}",
+                f"update.fly-server.ru=file:/var/www/update|browse|legacy=/update|{self.DENY}",
             ],
         )
         rules = lighttpd.audit(self.LTPD, self._sites(cfg))
@@ -858,6 +858,135 @@ class MigrationConsistencyTests(unittest.TestCase):
         rules = lighttpd.audit(self.LTPD, self._sites(cfg))
         deny_rule = next(r for r in rules if r.name == "доступ к исполняемым файлам")
         self.assertEqual(deny_rule.level, lighttpd.LOST)
+
+
+class LegacyPrefixTests(unittest.TestCase):
+    """Старый document-root = /var/www: клиенты ходят по /etc/файл.
+
+    Сайты вынесены на отдельные домены с корнем /var/www/etc, поэтому
+    /etc/файл превращался в /var/www/etc/etc/файл и отдавал 404 — так ломался
+    FlyLinkDC: его собственный конфиг внутри зеркала ссылается на
+    http://etc.fly-server.ru/etc/xxx-block.txt.
+    """
+
+    def _block(self, options: str, root: str = "/var/www/etc") -> str:
+        return installer._caddy_static_block(
+            Config(), "etc.fly-server.ru", root, installer._static_options(options)
+        )
+
+    def test_legacy_option_is_parsed(self) -> None:
+        self.assertEqual(installer._static_options("legacy=/etc"), {"legacy": ["/etc"]})
+
+    def test_legacy_matcher_and_strip(self) -> None:
+        block = self._block("browse|legacy=/etc")
+        self.assertIn("@legacy path /etc /etc/ /etc/*", block)
+        self.assertIn("uri @legacy strip_prefix /etc", block)
+
+    def test_legacy_without_browse_still_handled(self) -> None:
+        """Без handle стрип был бы недостижим: file_server перехватил бы запрос."""
+        block = self._block("legacy=/pvs-studio", root="/var/www/pvs-studio")
+        self.assertIn("handle @legacy {", block)
+        self.assertIn("uri @legacy strip_prefix /pvs-studio", block)
+
+    def test_legacy_comes_before_catch_all(self) -> None:
+        block = self._block("browse|legacy=/etc")
+        self.assertLess(block.index("handle @legacy"), block.rindex("handle {"))
+
+    def test_strip_precedes_file_server_in_block(self) -> None:
+        """Иначе file_server отдал бы 404 раньше, чем сработает стрип."""
+        block = self._block("browse|legacy=/etc")
+        legacy_block = block[block.index("handle @legacy {"):]
+        self.assertLess(legacy_block.index("strip_prefix"), legacy_block.index("file_server"))
+
+    def test_deny_still_applies_with_legacy(self) -> None:
+        block = self._block("browse|legacy=/etc|deny=*.php")
+        self.assertIn("@forbidden path *.php", block)
+        # запрет проверяется первым, до стрипа
+        self.assertLess(block.index("@forbidden"), block.index("handle @legacy"))
+
+    def test_no_legacy_means_no_legacy_handles(self) -> None:
+        block = self._block("browse|index=index.html")
+        self.assertNotIn("@legacy", block)
+
+    def test_trailing_slash_in_legacy_is_trimmed(self) -> None:
+        """strip_prefix /etc/ срезал бы не то: хвостовой слэш обязателен к удалению."""
+        block = self._block("browse|legacy=/etc/")
+        self.assertIn("@legacy path /etc /etc/ /etc/*", block)
+        self.assertIn("uri @legacy strip_prefix /etc\n", block + "\n")
+
+    def test_rejects_bad_legacy(self) -> None:
+        for bad in ("legacy=etc", "legacy=/etc/*", "legacy=../etc"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                installer._static_options(bad)
+
+    def test_multiple_legacy_prefixes(self) -> None:
+        """У каждого префикса свой matcher: один общий стрипнул бы не тот путь."""
+        block = self._block("browse|legacy=/etc,/mirror")
+        self.assertIn("@legacy0 path /etc /etc/ /etc/*", block)
+        self.assertIn("@legacy1 path /mirror /mirror/ /mirror/*", block)
+        self.assertIn("uri @legacy0 strip_prefix /etc\n", block + "\n")
+        self.assertIn("uri @legacy1 strip_prefix /mirror\n", block + "\n")
+
+
+class HeaderOptionTests(unittest.TestCase):
+    """mod_setenv lighttpd запрещал кэшировать /pvs-studio/."""
+
+    def test_header_keeps_commas_in_value(self) -> None:
+        """«Cache-Control: a, b» — один заголовок, а не список из двух."""
+        opts = installer._static_options("header=Cache-Control: no-store, no-cache")
+        # тройка (путь, имя, значение); пустой путь = на весь сайт
+        self.assertEqual(opts["header"], [("", "Cache-Control", "no-store, no-cache")])
+
+    def test_header_field_and_value_are_separate_tokens(self) -> None:
+        """Одним кавычным токеном Caddy счёл бы всю строку ИМЕНЕМ заголовка."""
+        block = installer._caddy_static_block(
+            Config(), "pvs-studio.fly-server.ru", "/var/www/pvs-studio",
+            installer._static_options("header=Cache-Control: no-store, no-cache, must-revalidate"),
+        )
+        self.assertIn('header Cache-Control "no-store, no-cache, must-revalidate"', block)
+        self.assertNotIn('header "Cache-Control', block)
+
+    def test_header_appears_in_block(self) -> None:
+        block = installer._caddy_static_block(
+            Config(), "pvs-studio.fly-server.ru", "/var/www/pvs-studio",
+            installer._static_options("header=Cache-Control: no-store|header=Pragma: no-cache"),
+        )
+        # без пробелов Caddy кавычки не требует и получает валидный токен
+        self.assertIn("header Cache-Control no-store", block)
+        self.assertIn("header Pragma no-cache", block)
+
+    def test_rejects_malformed_header(self) -> None:
+        for bad in ("header=NoColon", "header=плохое", "header="):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                installer._static_options(bad)
+
+    def test_path_scoped_header_parsed(self) -> None:
+        """mod_setenv действовал на путь, а не на весь сайт."""
+        opts = installer._static_options("header=/pvs-studio/*=Pragma: no-cache")
+        self.assertEqual(opts["header"], [("/pvs-studio", "Pragma", "no-cache")])
+
+    def test_path_scoped_header_uses_matcher(self) -> None:
+        """Запрет кэша на весь www-сайт был бы грубой ошибкой."""
+        block = installer._caddy_static_block(
+            Config(), "www.fly-server.ru", "/var/www",
+            installer._static_options("header=/pvs-studio/*=Cache-Control: no-store"),
+        )
+        self.assertIn("@hdr0 path /pvs-studio /pvs-studio/ /pvs-studio/*", block)
+        self.assertIn('header @hdr0 Cache-Control no-store', block)
+        self.assertNotIn("\theader Cache-Control", block)
+
+    def test_rejects_bad_scoped_header(self) -> None:
+        for bad in ("header=pvs-studio/*=Pragma: no-cache", "header=/a b/*=Pragma: no-cache"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                installer._static_options(bad)
+
+    def test_error_message_lists_known_options(self) -> None:
+        with self.assertRaisesRegex(ValueError, "legacy="):
+            installer._static_options("nosuchoption=1")
+
+    def test_option_without_value_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "нуждаются в значениях"):
+            installer._static_options("legacy")
 
 
 if __name__ == "__main__":

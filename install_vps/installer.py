@@ -134,15 +134,19 @@ _UPSTREAM_RE = re.compile(r"^(https?://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,30}$")
 # тег образа Beszel: hub и agent обязаны совпадать, «latest» недопустим
 _SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
-# опции сайта-статики в caddy_site: browse, browse=/путь/, index=..., hide=..., deny=...
+# опции сайта-статики в caddy_site: browse, browse=/путь/, index=..., hide=...,
+# deny=..., legacy=/префикс/, header="Name: value"
 _STATIC_OPTION_RE = re.compile(
-    r"^(browse|index|hide|deny)(=([A-Za-z0-9./_*~!+-]+(,[A-Za-z0-9./_*~!+-]+)*)?)?$"
+    r"^(browse|index|hide|deny|legacy|header)"
+    r"(=([A-Za-z0-9./_*~!+ :,=-]+(,[A-Za-z0-9./_*~!+ :,=-]+)*)?)?$"
 )
 # шаблон имени файла для index/hide/deny: буквы, цифры и маски (* . ~ - _ ! +)
 _STATIC_ITEM_RE = re.compile(r"^[A-Za-z0-9.*_~!+-]+$")
-# путь URL для browse=/путь/: без масок, только буквы, цифры, точка, дефис,
-# подчёркивание и слэш — он попадает в matcher `path` готового Caddyfile
+# путь URL для browse=/путь/ и legacy=/префикс/: без масок, только буквы, цифры,
+# точка, дефис, подчёркивание и слэш — он попадает в matcher `path` готового Caddyfile
 _STATIC_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
+# заголовок ответа для header="Name: value" — печатается в Caddyfile как есть
+_HEADER_RE = re.compile(r"^[A-Za-z0-9-]+: [^\r\n]+$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # каталог статики для caddy_site вида "домен=file:/var/www"
 _STATIC_ROOT_RE = re.compile(r"^/[A-Za-z0-9._/-]*$")
@@ -279,6 +283,31 @@ def _split_site(raw: str) -> tuple[str, str, str]:
     return domain.strip(), upstream.strip(), options
 
 
+def _parse_header_option(values: str) -> tuple[str, str, str]:
+    """`header=Name: value` либо `header=/путь/*=Name: value`.
+
+    Значения запятыми не разделяются: «Cache-Control: a, b» — один заголовок.
+    Необязательный префикс пути отделяется первым «=»: mod_setenv lighttpd
+    действовал на конкретный путь на всех доменах, и на www запрет кэша нужен
+    только для /pvs-studio/, а не для всего сайта.
+    """
+    scope, sep, header = values.strip().partition("=")
+    if not sep:
+        scope, header = "", scope
+    elif not _STATIC_PATH_RE.match(scope.rstrip("*")):
+        raise ValueError(
+            f"Некорректный путь в опции header: {scope!r}; "
+            "нужен абсолютный путь, напр. header=/pvs-studio/*=Pragma: no-cache"
+        )
+    if not _HEADER_RE.match(header):
+        raise ValueError(
+            f"Недопустимый заголовок {header!r} в caddy_site; нужен "
+            'вид "Name: значение", например header=Cache-Control: no-store'
+        )
+    field, _, value = header.partition(": ")
+    return scope.rstrip("/*"), field, value.strip()
+
+
 def _static_options(options: str) -> dict[str, list[str]]:
     """Опции file_server из хвоста 'browse|browse=/a/|index=a,b|hide=.svn'."""
     parsed: dict[str, list[str]] = {}
@@ -291,19 +320,23 @@ def _static_options(options: str) -> dict[str, list[str]]:
         if not _STATIC_OPTION_RE.match(chunk):
             raise ValueError(
                 f"Неизвестная опция сайта-статики: {chunk!r}; поддерживаются "
-                "browse, browse=/путь/, index=файл,файл, hide=шаблон, deny=шаблон"
+                "browse, browse=/путь/, index=файл,файл, hide=шаблон, deny=шаблон, "
+                'legacy=/префикс/, header="Name: value", header=/путь/*="Name: value"'
             )
         name, _, values = chunk.partition("=")
         items = [item.strip() for item in values.split(",") if item.strip()]
+        if name == "header":
+            parsed.setdefault(name, []).append(_parse_header_option(values))
+            continue
         if name != "browse" and not items:
             raise ValueError(f"Опции {name} в caddy_site нуждаются в значениях: {chunk!r}")
-        if name == "browse" and items:
+        if name in ("browse", "legacy"):
             bad_paths = [item for item in items if not _STATIC_PATH_RE.match(item)]
             if bad_paths:
                 raise ValueError(
-                    f"Недопустимые пути в browse= в caddy_site: {', '.join(bad_paths)}; "
+                    f"Недопустимые пути в {name}= в caddy_site: {', '.join(bad_paths)}; "
                     "нужен путь URL с ведущим слэшем и без масок — например "
-                    "browse=/install/"
+                    f"{name}=/etc"
                 )
             parsed[name] = items
             continue
@@ -358,16 +391,41 @@ def _caddy_static_block(
             return [f"{pad}{head}"]
         return [f"{pad}{head} {{"] + [f"{pad}\t{line}" for line in inner] + [f"{pad}}}"]
 
+    # matcher `path` не подставляет хвостовой слэш, поэтому сам путь и его
+    # подкаталоги перечисляем явно
+    def path_patterns(prefixes: list[str]) -> list[str]:
+        out: list[str] = []
+        for prefix in prefixes:
+            out += [prefix, f"{prefix}/", f"{prefix}/*"]
+        return out
+
     lines = [f"\troot * {root}"]
+    for num, (scope, field, value) in enumerate(opts.get("header") or []):
+        if not scope:
+            lines.append("\theader " + field + " " + _caddy_token(value))
+            continue
+        # директива header умеет Matcher первым аргументом; свой на каждый путь,
+        # иначе запрет кэша лёг бы на весь сайт вместо /путь/
+        matcher = f"@hdr{num}"
+        lines.append(f"\t{matcher} path " + " ".join(path_patterns([scope])))
+        lines.append(f"\theader {matcher} " + field + " " + _caddy_token(value))
+    legacy = [item.rstrip("/") for item in (opts.get("legacy") or [])]
     deny = opts.get("deny")
-    paths = opts.get("browse") or []
+    paths = [item.rstrip("/") for item in (opts.get("browse") or [])]
+
+    # блоки сайта: (matcher, листинг, legacy-префикс). Пустой список —
+    # file_server без handle, как и раньше: порядок директив Caddy приходится
+    # угадывать, а handle без нужды только добавляет мест, где что-то может
+    # не сработать.
+    blocks: list[tuple[str, bool, str]] = []
+    for num, prefix in enumerate(legacy):
+        matcher = "@legacy" if len(legacy) == 1 else f"@legacy{num}"
+        lines.append(f"\t{matcher} path " + " ".join(path_patterns([prefix])))
+        blocks.append((matcher, "browse" in opts, prefix))
     if paths:
-        patterns = []
-        for raw_path in paths:
-            prefix = raw_path.rstrip("/")
-            # хвостовой слэш сам по себе в matcher не подставляется, поэтому
-            # и сам путь, и его подкаталоги перечисляем явно
-            patterns += [prefix, f"{prefix}/", f"{prefix}/*"]
+        lines.append("\t@listing path " + " ".join(path_patterns(paths)))
+        blocks.append(("@listing", True, ""))
+    if blocks:
         if deny:
             # `respond` упорядочен после `handle`, поэтому снаружи он не
             # сработал бы вовсе — проверку запрета переносим внутрь блоков
@@ -375,13 +433,14 @@ def _caddy_static_block(
             lines.append("\thandle @forbidden {")
             lines.append("\t\trespond 403")
             lines.append("\t}")
-        lines.append("\t@listing path " + " ".join(patterns))
-        lines.append("\thandle @listing {")
-        lines.extend(file_server_lines(True, "\t\t"))
-        lines.append("\t}")
-        lines.append("\thandle {")
-        lines.extend(file_server_lines(False, "\t\t"))
-        lines.append("\t}")
+        for matcher, browse, strip in [*blocks, ("", browse_flag(opts, paths), "")]:
+            lines.append("\t" + (f"handle {matcher}" if matcher else "handle") + " {")
+            if strip:
+                # стрип legacy-префикса — первой директивой блока: иначе
+                # file_server отдал бы 404 раньше, чем сработает переписывание
+                lines.append(f"\t\turi {matcher} strip_prefix {strip}")
+            lines.extend(file_server_lines(browse, "\t\t"))
+            lines.append("\t}")
     else:
         if deny:
             lines.append("\t@forbidden path " + " ".join(deny))
@@ -389,6 +448,15 @@ def _caddy_static_block(
         lines.extend(file_server_lines("browse" in opts, "\t"))
     lines.append("\tencode gzip")
     return f"{domain} {{\n" + _access_log_block(cfg) + "\n".join(lines) + "\n}\n"
+
+
+def browse_flag(opts: dict, paths: list[str]) -> bool:
+    """Листинг в catch-all: только когда он задан на весь сайт.
+
+    При `browse=/путь/` листинг точечный, и catch-all (всё остальное) его
+    выключать обязан — иначе откроется всё дерево торрентов.
+    """
+    return "browse" in opts and not paths
 
 
 def _access_log_block(cfg: Config) -> str:
