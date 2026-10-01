@@ -1205,6 +1205,49 @@ class StaticSiteTests(unittest.TestCase):
         self.assertIn("cmp -s", script)
         self.assertIn("rm -f /opt/caddy/.sites-new/www.example.com.caddy", script)
 
+    def test_site_norm_reads_root_file_on_sudo_host(self) -> None:
+        # `$SUDO cat` внутри `<(...)` не работает: в redirect-слове bash не делает
+        # word splitting и искал файл с именем "sudo" — тогда сравнение всегда
+        # видело разницу, и каждый прогон бэкапил все 12 сайтов, вытесняя срезы
+        script = installer._caddy_sites_script(full_config(
+            caddy_sites=["www.example.com=file:/var/www"], caddy_portal="portal.example.com"))
+        bs = installer._bootstrap(False)
+        self.assertNotIn("<($SUDO cat", script + bs)
+        self.assertIn("site_norm() {", bs)
+        self.assertIn('{ $SUDO cat "$1" 2>/dev/null || cat "$1"; } |', bs)
+
+    def test_bcrypt_salt_change_is_not_a_site_change(self) -> None:
+        # живой прогон на dc показал: пароль портала хэшируется с новой солью
+        # каждый раз, portal.caddy всегда считался изменившимся, и только он
+        # плодил срезы бэкапа (на хосте их стало 4 за один прогон)
+        bs = installer._bootstrap(False)
+        start = bs.index("site_norm() {")
+        fn = bs[start:bs.index("\n}", start) + 2]
+
+        def same(a: str, b: str) -> bool:
+            with tempfile.TemporaryDirectory() as tmp:
+                fa, fb = Path(tmp) / "a.caddy", Path(tmp) / "b.caddy"
+                fa.write_text(a)
+                fb.write_text(b)
+                out = subprocess.run(
+                    ["bash", "-c", f"{fn}\ncmp -s <(site_norm {fa}) <(site_norm {fb})"],
+                    capture_output=True, text=True, check=False,
+                )
+                return out.returncode == 0
+
+        body = "portal.example.com {\n\trespond \"hi\"\n}\n"
+        hash_a = "\t\tadmin $2a$14$" + "A" * 53 + "\n"
+        hash_b = "\t\tadmin $2a$14$" + "B" * 53 + "\n"
+        # новая соль при том же пароле — не изменение
+        self.assertTrue(same(body + hash_a, body + hash_b))
+        # черновик с заглушкой против файла с настоящим хэшем — тоже не изменение
+        # (именно этот случай и плодил срезы на dc)
+        self.assertTrue(same(body + "\t\tadmin __PORTAL_HASH__\n", body + hash_a))
+        # а настоящее отличие содержимого ловится
+        self.assertFalse(same(body + hash_a, body + hash_b + "\trespond \"bye\"\n"))
+        # и отличие не-xэша тоже
+        self.assertFalse(same(body + hash_a, body.replace("hi", "bye") + hash_a))
+
     def test_old_site_backups_pruned(self) -> None:
         script = installer._caddy_sites_script(full_config(
             caddy_sites=["www.example.com=file:/var/www"]))
@@ -1356,6 +1399,83 @@ class GeneratedScriptTests(unittest.TestCase):
 
     def test_full_install_script_is_valid_bash(self) -> None:
         bash_check(self._install_script(full_config()))
+
+    def _apt_retry_harness(self, scenario: str) -> tuple[int, str]:
+        """Гоняет настоящий apt_retry из bootstrap с подменённым apt-get.
+
+        Счётчик попыток живёт в файле, а не в переменной: apt_get в helper
+        стоит в левой части пайпа и выполняется в подshell, где `calls`
+        не увидит инкремент.
+        """
+        script = self._install_script(full_config())
+        start = script.index('APT_LOG="$(mktemp)"')
+        helper = script[start:script.index("\n}", start) + 2].replace("sleep 10", "sleep 0")
+        harness = (
+            'set -euo pipefail\nSUDO=""\nCALLS="$(mktemp)"\n'
+            + helper
+            + f"""
+apt-get() {{
+  n=$(wc -l < "$CALLS")
+  n=$((n + 1))
+  echo "$n" >> "$CALLS"
+  case "{scenario}" in
+    lock-twice)
+      if [ "$n" -le 2 ]; then
+        echo "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 42 (unattended-upgr)" >&2
+        return 100
+      fi
+      echo "установлено"; return 0 ;;
+    lock-always)
+      echo "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 42" >&2
+      return 100 ;;
+    real-fail)
+      echo "E: Unable to locate some files" >&2; return 100 ;;
+    ok) echo "установлено"; return 0 ;;
+  esac
+}}
+code=0
+apt_retry install -y demo >/dev/null 2>&1 || code=$?
+echo "код=$code попыток=$(wc -l < "$CALLS")"
+"""
+        )
+        out = subprocess.run(
+            ["bash", "-c", harness], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(out.stderr.strip(), "", out.stdout)
+        tail = out.stdout.strip().splitlines()[-1]
+        code = int(tail.split("код=")[1].split()[0])
+        attempts = int(tail.split("попыток=")[1])
+        return code, attempts
+
+    def test_apt_retry_waits_out_dpkg_lock(self) -> None:
+        # unattended-upgrades берёт dpkg-lock в фоне: так install() умер на dc
+        # в секции zram с кодом 100 сразу после включения unattended-upgrades
+        code, attempts = self._apt_retry_harness("lock-twice")
+        self.assertEqual(code, 0)
+        self.assertEqual(attempts, 3, "должен дождаться и повторить")
+
+    def test_apt_retry_keeps_real_failure_code(self) -> None:
+        # регрессия: `rc=$?` стоял после «if cmd; then … fi», а такой if без
+        # else успешен, поэтому настоящая ошибка apt уезжала с кодом 0 и
+        # установка продолжалась как будто всё прошло
+        code, attempts = self._apt_retry_harness("real-fail")
+        self.assertEqual(code, 100, "код apt-get обязан дойти до вызывающего")
+        self.assertEqual(attempts, 1, "ошибку не из-за блокировки повторять нельзя")
+
+    def test_apt_retry_gives_up_on_permanent_lock(self) -> None:
+        code, attempts = self._apt_retry_harness("lock-always")
+        self.assertEqual(code, 1)
+        self.assertEqual(attempts, 12, "ограниченное число попыток, а не бесконечный цикл")
+
+    def test_no_bare_apt_get_left(self) -> None:
+        # весь apt-get обязан идти через apt_retry: забытая скобка где-то в
+        # шаблоне вернёт ровно тот баг с блокировкой, который чинили
+        script = self._install_script(full_config())
+        body = script[script.index("\n}", script.index('APT_LOG="$(mktemp)"')) + 2:]
+        bare = [ln for ln in body.splitlines() if "$SUDO apt-get" in ln]
+        self.assertEqual(bare, [], "apt-get вне apt_retry: " + "; ".join(bare))
+        self.assertIn("apt_retry install -y curl ca-certificates gnupg", script)
+        self.assertIn("xargs -r apt_retry purge -y", script)
 
     def test_dozzle_in_script(self) -> None:
         script = self._install_script(full_config(dozzle=True))

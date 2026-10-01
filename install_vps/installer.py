@@ -472,6 +472,19 @@ def _caddy_caddyfile(email: str) -> str:
     return "\n".join(lines)
 
 
+# Секреты приводятся к заглушке перед сравнением файлов сайтов. Два вида:
+#   * `__PORTAL_HASH__` — заглушка в черновике: хэш считает Caddy на хосте и
+#     подставляется уже после записи файла, поэтому в черновике его ещё нет;
+#   * `$2a$14$…` / `$argon2id$…` — настоящие хэши, у bcrypt новая соль при
+#     каждом прогоне.
+# Без такой оговорки portal.caddy всегда считался бы изменившимся, и каждый
+# идемпотентный повторный прогон плодил срез бэкапа, вытесняя настоящие копии.
+_SECRET_NORM = (
+    r"sed -e 's|__PORTAL_HASH__|<secret>|g' "
+    r"-e 's|\$[0-9a-z]\{2,\}\$[0-9]\{2\}\$[./A-Za-z0-9]\{53\}|<secret>|g'"
+)
+
+
 def _write_site_script(name: str, content: str) -> str:
     """Один сайт = один файл в sites/, подключается через import в Caddyfile.
 
@@ -483,6 +496,14 @@ def _write_site_script(name: str, content: str) -> str:
     иначе означал бы дописывание конфига заново. Копия делается только если
     содержимое реально меняется — иначе каждый идемпотентный повторный прогон
     плодил бы одинаковые копии. Хранятся последние {SITE_BACKUP_KEEP} срезов.
+
+    Сравнение идёт по содержимому без секретов (см. `site_norm` в
+    `_bootstrap`): в черновике вместо хэша пароля стоит `__PORTAL_HASH__`
+    (хеш считает контейнер Caddy уже после записи), а сам bcrypt каждый раз
+    получает новую соль. Без такой оговорки portal.caddy всегда считался бы
+    изменившимся, и каждый идемпотентный повторный прогон плодил срез бэкапа,
+    вытесняя из ротации настоящие копии. Файл при этом всё равно
+    переписывается — смена пароля применяется как обычно.
     """
     # черновик пишем вне sites/: каталог смонтирован в контейнер и подключён
     # через import /etc/caddy/sites/*.caddy, и мусор там не нужен
@@ -497,7 +518,7 @@ def _write_site_script(name: str, content: str) -> str:
         f"{content}"
         "CADDY_SITE_EOF\n"
         f"if [ -f {CADDY_SITES_DIR}/{name}.caddy ] && "
-        f"cmp -s {new_tmp} {CADDY_SITES_DIR}/{name}.caddy; then\n"
+        f"cmp -s <(site_norm {new_tmp}) <(site_norm {CADDY_SITES_DIR}/{name}.caddy); then\n"
         f"  $SUDO rm -f {new_tmp}\n"
         "else\n"
         f"  if [ -f {CADDY_SITES_DIR}/{name}.caddy ]; then\n"
@@ -1147,15 +1168,51 @@ def _bootstrap(sudo: bool) -> str:
         'fi',
         # битый/устаревший docker.list и keyring ломают весь apt-get update
         f'$SUDO rm -f {DOCKER_SOURCES_LIST} {DOCKER_KEYRING_FILE}',
+        # unattended-upgrades берёт dpkg-lock в фоне, и следующий apt-get на том
+        # же хосте падает с «Could not get lock ... is held by process N» — так
+        # install() умер на секции zram сразу после включения
+        # unattended-upgrades. Ждём чужой apt и повторяем, но ТОЛЬКО при гонке за
+        # блокировкой: настоящая ошибка установки не должна уходить в retry.
+        'APT_LOG="$(mktemp)"',
+        'apt_retry() {',
+        '  local attempt=1 max=12 rc=0',
+        '  while [ "$attempt" -le "$max" ]; do',
+        # rc=$? именно в ||-ветке: после «if cmd; then … fi» без else $ve равен 0
+        # (сам if успешен), и настоящая ошибка apt-get уходила бы с кодом 0
+        '    $SUDO apt-get "$@" 2>&1 | tee "$APT_LOG" || rc=$?',
+        '    if [ "$rc" -eq 0 ]; then',
+        '      return 0',
+        '    fi',
+        '    if grep -qE "Could not get lock|Unable to acquire the dpkg frontend lock'
+        '|Wait for it or run|is held by process" "$APT_LOG"; then',
+        '      echo "  apt занят другим процессом (обычно unattended-upgrades) —'
+        ' ждём 10с и повторяем ($attempt/$max)" >&2',
+        '      sleep 10',
+        '      attempt=$((attempt + 1))',
+        '      rc=0',
+        '      continue',
+        '    fi',
+        '    echo "ERROR: apt-get упал не из-за блокировки dpkg — повтор не поможет" >&2',
+        '    return "$rc"',
+        '  done',
+        '  echo "ERROR: apt-get всё ещё занят после $((max * 10))с" >&2',
+        '  return 1',
+        '}',
+        # нормализованное чтение файла сайта для сравнения: на не-root хосте файл
+        # принадлежит root. `$SUDO cat` внутри `<(...)` не годится — в redirect-
+        # слове bash не делает word splitting и искал бы файл с именем "sudo"
+        'site_norm() {',
+        '  { $SUDO cat "$1" 2>/dev/null || cat "$1"; } | ' + _SECRET_NORM,
+        '}',
     ]
     return "\n".join(lines) + "\n"
 
 
-APT_UPDATE = 'echo "==> apt-get update"\n$SUDO apt-get update\n'
+APT_UPDATE = 'echo "==> apt-get update"\napt_retry update\n'
 
 PKG_INSTALL = (
     'echo "==> установка пакетов: {packages}"\n'
-    "$SUDO apt-get install -y {packages}\n"
+    "apt_retry install -y {packages}\n"
 )
 
 DOCKER_REPO = r"""
@@ -1168,7 +1225,7 @@ fi
 echo "deb [arch=$ARCH signed-by={keyring_file}] https://download.docker.com/linux/ubuntu {codename} stable" \
   | $SUDO tee {sources_list}
 echo "==> apt-get update (после добавления docker-репо)"
-$SUDO apt-get update
+apt_retry update
 """
 
 SWAP = r"""
@@ -1202,7 +1259,7 @@ fi
 
 UNATTENDED_UPGRADES = r"""
 echo "==> unattended-upgrades: без интерактивных вопросов"
-$SUDO apt-get install -y unattended-upgrades
+apt_retry install -y unattended-upgrades
 $SUDO install -m 0755 -d /etc/apt/apt.conf.d
 cat <<'UU_EOF' | $SUDO tee /etc/apt/apt.conf.d/52unattended-upgrades-local >/dev/null
 // Локальные настройки install-vps.
@@ -1256,13 +1313,15 @@ OLD_KERNELS="$($SUDO dpkg -l 'linux-image-*' 'linux-headers-*' 'linux-modules-*'
   | grep -Fxv -f <(printf '%s\n' "$PROTECTED") || true)"
 if [ -n "$OLD_KERNELS" ]; then
   # без --auto-remove: autoremove однажды снёс модули и образ текущего ядра
-  echo "$OLD_KERNELS" | xargs -r $SUDO apt-get purge -y
+  # через apt_retry: секция идёт после unattended-upgrades и может встретить
+  # тот же dpkg-lock
+  echo "$OLD_KERNELS" | xargs -r apt_retry purge -y
 else
   echo "  старых ядер не найдено — нечего чистить"
 fi
 if ! $SUDO dpkg -s "linux-image-$CURRENT" >/dev/null 2>&1; then
   echo "  ВОССТАНОВЛЕНИЕ: пакет ядра linux-image-$CURRENT отсутствует — ставим заново"
-  $SUDO apt-get install -y "linux-image-$CURRENT" "linux-modules-$CURRENT"
+  apt_retry install -y "linux-image-$CURRENT" "linux-modules-$CURRENT"
 fi
 if [ -e "/boot/vmlinuz-$CURRENT" ]; then
   echo "  OK: /boot/vmlinuz-$CURRENT на месте (хост перезагрузится)"
@@ -1388,7 +1447,7 @@ fi
 
 ZRAM = r"""
 echo "==> zram: сжатый своп {size_mb}M (алгоритм zstd)"
-$SUDO apt-get install -y systemd-zram-generator
+apt_retry install -y systemd-zram-generator
 $SUDO install -m 0755 -d /etc/systemd
 cat <<'ZRAM_CONF_EOF' | $SUDO tee /etc/systemd/zram-generator.conf >/dev/null
 [zram0]

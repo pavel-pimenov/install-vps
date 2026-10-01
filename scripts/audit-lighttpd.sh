@@ -68,15 +68,31 @@ if not host:
     print("В конфиге нет host — нечего проверять", file=sys.stderr)
     raise SystemExit(2)
 
-# конфиг lighttpd мог остаться в conf-enabled/*.conf, поэтому читаем все
+# конфиг lighttpd мог остаться в conf-enabled/*.conf, поэтому читаем все.
+# Скрипт различает три исхода явными метками, потому что «не получилось
+# прочитать» и «lighttpd уже удалён» — это противоположные новости, а раньше
+# обе печатались одинаково, и сломанный sudo читался как успешная миграция.
 read_script = r'''
+found=0
+unreadable=0
 for f in /etc/lighttpd/lighttpd.conf /etc/lighttpd/conf-enabled/*.conf; do
-  [ -r "$f" ] && { echo "### $f"; cat "$f"; }
+  [ -e "$f" ] || continue
+  found=1
+  if [ -r "$f" ]; then
+    echo "### FILE $f"
+    cat "$f"
+  else
+    unreadable=1
+  fi
 done
+[ "$found" = 0 ] && echo "### LIGHTTPD_ABSENT"
+[ "$unreadable" = 1 ] && echo "### LIGHTTPD_UNREADABLE"
+exit 0
 '''
 cmd = ["ssh", "-p", port, "-i", key, "-o", "BatchMode=yes"]
 if cfg.accept_new:
     cmd += ["-o", "StrictHostKeyChecking=accept-new"]
+use_stdin = not cfg.sudo
 if cfg.sudo:
     # sudo оборачивает bash -c, а не цикл: «sudo for f in ...» — синтаксическая
     # ошибка, и такой вызов молча ничего не читает
@@ -87,17 +103,45 @@ cmd += [f"{user}@{host}", read_cmd]
 
 proc = subprocess.run(
     cmd,
-    input=None if read_cmd != "bash -s" else read_script,
+    input=read_script if use_stdin else None,
     capture_output=True,
     text=True,
     check=False,
 )
-if proc.returncode != 0 or not proc.stdout.strip():
-    print(f"Не удалось прочитать lighttpd.conf на {host}: {proc.stderr.strip()}", file=sys.stderr)
-    print("Если lighttpd уже удалён — аудит не нужен, миграция закончена.", file=sys.stderr)
+out = proc.stdout
+
+# 1. сам ssh или sudo не сработал — это поломка доступа, а не итог миграции
+if proc.returncode != 0:
+    hint = ""
+    if cfg.sudo and "sudo" in proc.stderr.lower():
+        hint = "\nПохоже, на хосте нет sudo -n без пароля (NOPASSWD)."
+    print(f"Не удалось выполнить команду на {host}: {proc.stderr.strip()}", file=sys.stderr)
+    if hint:
+        print(hint.strip(), file=sys.stderr)
+    else:
+        print("Миграция lighttpd на этом хосте ещё не завершена — разбираться нужно.", file=sys.stderr)
     raise SystemExit(2)
 
-rules = lighttpd.audit(proc.stdout, sites)
+# 2. файлов нет вообще: lighttpd снят, сверять нечего — это успех, а не ошибка
+if "### LIGHTTPD_ABSENT" in out:
+    print(f"на {host}: lighttpd.conf не найден — lighttpd удалён, аудит не нужен.")
+    raise SystemExit(0)
+
+# 3. файлы есть, но не прочитались: почти всегда виноват sudo, а не миграция
+if "### LIGHTTPD_UNREADABLE" in out:
+    print(
+        f"на {host}: файлы lighttpd есть, но они не прочитались — "
+        f"проверьте sudo -n (NOPASSWD) для пользователя {user}.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+# 4. остался пустой вывод при нулевом коде — тоже тишина, а не «всё хорошо»
+if not out.strip():
+    print(f"на {host}: команда отработала, но не вывела ничего — нечего сверять.", file=sys.stderr)
+    raise SystemExit(2)
+
+rules = lighttpd.audit(out, sites)
 static = [s for s in sites if s[1]]
 print(f"хост: {host} ({len(static)} сайтов-статики из {len(sites)} в caddy_sites)")
 print(lighttpd.report(rules))
