@@ -410,7 +410,7 @@ install_vps/
   ssh.py        # RemoteHost: сборка команды ssh, потоковый запуск скрипта
   installer.py  # bash-шаблоны и генераторы (Caddy, Beszel, портал, утилиты)
   lighttpd.py   # аудит миграции: что из lighttpd.conf не перенесено в Caddy
-tests/          # unittest: конфиг, валидация, bash -n по собранному скрипту
+tests/          # unittest: конфиг, валидация, ssh, аудит, bash -n по скрипту
 scripts/check.sh        # локальная проверка: ruff + compileall + тесты
 scripts/verify-all.sh   # --verify-only по всем config.*.local.toml подряд
 scripts/audit-lighttpd.sh  # сверка lighttpd.conf с caddy_site на хосте

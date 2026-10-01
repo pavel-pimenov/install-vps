@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import html
+import ipaddress
 import re
 import subprocess
 from dataclasses import dataclass
@@ -98,9 +99,28 @@ def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def _valid_allow_entry(value: str) -> bool:
+    """Адрес или CIDR для `ufw allow from` — понимает ли это ipaddress.
+
+    Свой regex раньше принимал 999.999.999.999 и /33: ufw молча завёл бы
+    бесполезное правило, порт агента остался бы закрытым, а установщик
+    отчитался бы об успехе. Разбор через ipaddress отсекает и мусор вроде
+    «не адрес», который регулярка принимала как IPv6.
+    """
+    try:
+        ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return False
+    return True
+
+
 def _caddy_token(value: str) -> str:
-    """Токен Caddyfile: в кавычках, если в значении есть спецсимволы."""
-    if value and not any(ch.isspace() or ch in "\"{}#" for ch in value):
+    """Токен Caddyfile: в кавычках, если в значении есть спецсимволы.
+
+    Обратный слэш в Caddyfile — символ экранирования, поэтому значение с ним
+    тоже обязано быть в кавычках, иначе следующий символ съедается парсером.
+    """
+    if value and not any(ch.isspace() or ch in "\"{}#\\" for ch in value):
         return value
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -124,10 +144,6 @@ _STATIC_ITEM_RE = re.compile(r"^[A-Za-z0-9.*_~!+-]+$")
 # подчёркивание и слэш — он попадает в matcher `path` готового Caddyfile
 _STATIC_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-# адрес или CIDR: beszel_agent_allow открывает порт агента конкретным хостам
-_CIDR_RE = re.compile(
-    r"^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9a-fA-F:]{2,39}(/[0-9]{1,3})?$"
-)
 # каталог статики для caddy_site вида "домен=file:/var/www"
 _STATIC_ROOT_RE = re.compile(r"^/[A-Za-z0-9._/-]*$")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -2312,7 +2328,7 @@ def _validate_modes(cfg: Config) -> None:
                 "отдаёт Caddy (--caddy вместе с --portainer-domain)"
             )
     for cidr in cfg.beszel_agent_allow:
-        if not _CIDR_RE.match(cidr):
+        if not _valid_allow_entry(cidr):
             raise ValueError(
                 f"Некорректный beszel_agent_allow: {cidr!r}; нужен адрес или CIDR, "
                 "например 185.50.202.219/32"
