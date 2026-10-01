@@ -1939,6 +1939,35 @@ class LighttpdAuditTests(unittest.TestCase):
         ))
         self.assertEqual(self._rule(rules, "листинг каталогов").level, lighttpd.LOST)
 
+    def test_no_rules_is_reported_not_silent(self) -> None:
+        # report([]) молчал бы, и пустой отчёт читался бы как «всё хорошо
+        # проверено» — а это худший вид тишины для проверки
+        text = lighttpd.report([])
+        self.assertIn("переносимых правил не найдено", text)
+        self.assertIn("нечего сверять", text)
+
+    def test_absent_directive_produces_no_rule(self) -> None:
+        # нет index-file.names — переносить нечего, и записи про «потерянный
+        # индекс» быть не должно
+        rules = lighttpd.audit('server.document-root = "/var/www"\n', [
+            ("www.example.com", "/var/www", {"browse": []}),
+        ])
+        self.assertEqual([r.name for r in rules], [
+            "доступ к исполняемым файлам", "листинг каталогов",
+        ])
+
+    def test_all_hosts_run_without_crash(self) -> None:
+        # аудит гоняется по всем боевым хостам подряд, и он обязан пережить
+        # любой из них: пустой вывод с хоста и отсутствие статики
+        for text, sites in (
+            ("", []),
+            ("server.document-root = \"/var/www\"\n", [("api.example.com", "", {})]),
+            ("dir-listing.activate = \"enable\"\n", []),
+            ("# только комментарии\n", []),
+        ):
+            with self.subTest(text=text, sites=sites):
+                self.assertIsInstance(lighttpd.report(lighttpd.audit(text, sites)), str)
+
     def test_report_marks_and_summary(self) -> None:
         rules = lighttpd.audit(self.LTPD, self._sites(
             ("www.example.com", "/var/www", {"browse": []}),

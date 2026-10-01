@@ -32,28 +32,31 @@ fi
 
 # Читаем параметры подключения и список сайтов из TOML, затем тянем конфиг
 # lighttpd с хоста одним каналом и печатаем отчёт. Всё через python3: в проекте
-# нет внешних зависимостей, tomllib — стандартный модуль.
+# нет внешних зависимостей; конфиг читается тем же load_config, что и в cli.
 python3 - "$CFG" <<'PY'
 import shlex
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path.cwd()))
 from install_vps import lighttpd
+from install_vps.config import load_config
 from install_vps.installer import _split_site, _static_options
 
-cfg_path = Path(sys.argv[1])
-cfg = tomllib.loads(cfg_path.read_text("utf-8"))
+# Через load_config, а не tomllib: он же раскрывает `~` в key_path. Раньше тут
+# стояло tomllib + ручной .replace("~", home), и дефолт "~" превращался в
+# путь "/Users/admin" — ssh падал с «Load key: bad permissions», и аудит молча
+# выглядел как «lighttpd уже удалён».
+cfg = load_config(Path(sys.argv[1]))
 
-host = cfg.get("host", "")
-user = cfg.get("user", "root")
-port = str(cfg.get("port", 22))
-key = cfg.get("key_path", "~").replace("~", str(Path.home()), 1)
+host = cfg.host
+user = cfg.user
+port = str(cfg.port)
+key = cfg.key_path
 
 sites = []
-for raw in cfg.get("caddy_sites", []):
+for raw in cfg.caddy_sites:
     domain, upstream, options = _split_site(raw)
     if upstream.startswith(("file:", "static:")):
         root = upstream.split(":", 1)[1]
@@ -72,9 +75,9 @@ for f in /etc/lighttpd/lighttpd.conf /etc/lighttpd/conf-enabled/*.conf; do
 done
 '''
 cmd = ["ssh", "-p", port, "-i", key, "-o", "BatchMode=yes"]
-if cfg.get("accept_new", True):
+if cfg.accept_new:
     cmd += ["-o", "StrictHostKeyChecking=accept-new"]
-if cfg.get("sudo"):
+if cfg.sudo:
     # sudo оборачивает bash -c, а не цикл: «sudo for f in ...» — синтаксическая
     # ошибка, и такой вызов молча ничего не читает
     read_cmd = f"sudo bash -c {shlex.quote(read_script)}"

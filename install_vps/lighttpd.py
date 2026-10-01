@@ -242,19 +242,21 @@ def audit(text: str, sites: list[tuple[str, str, dict[str, list[str]]]]) -> list
 
     `sites` — тройки (домен, корень каталога, разобранные опции сайта).
     Корень — путь после `file:`, а для прокси-сайтов пустая строка.
+
+    Правила, которых в старом конфиге нет (нет `index-file.names` — нечего
+    переносить), просто не попадают в список: проверка без `dir-listing`
+    не должна порождать запись «потерян листинг».
     """
     lines = _uncommented(text)
     doc_root = _document_root(lines)
     static = [(domain, root, opts) for domain, root, opts in sites if root]
-    rules = [
+    checks = (
         _rule_deny(lines, static, doc_root),
         _rule_listing(lines, static),
+        _rule_scoped_listing(lines, static, doc_root),
         _rule_index(lines, static),
-    ]
-    scoped = _rule_scoped_listing(lines, static, doc_root)
-    if scoped is not None:
-        rules.insert(2, scoped)
-    return rules
+    )
+    return [rule for rule in checks if rule is not None]
 
 
 _MARKS = {OK: "OK:      ", WARN: "WARN:    ", LOST: "ПОТЕРЯНО:"}
@@ -263,6 +265,12 @@ _MARKS = {OK: "OK:      ", WARN: "WARN:    ", LOST: "ПОТЕРЯНО:"}
 def report(rules: list[Rule]) -> str:
     """Человекочитаемый отчёт по правилам аудита."""
     lines = ["аудит lighttpd -> Caddy:"]
+    if not rules:
+        # в lighttpd.conf нет ни одного переносимого правила: молчать нельзя,
+        # иначе пустой отчёт читается как «всё хорошо проверено»
+        lines.append("  WARN:     переносимых правил не найдено — сверьте вручную")
+        lines.append("  ИТОГО: нечего сверять")
+        return "\n".join(lines) + "\n"
     for rule in rules:
         lines.append(f"  {_MARKS[rule.level]} {rule.name} — {rule.what}")
         if rule.level != OK and rule.hint:
