@@ -1,0 +1,101 @@
+# Шаблон хоста — копия боевого конфига БЕЗ секретов.
+# Порядок работы: cp config-templates/<хост>.toml config.<хост>.local.toml,
+# затем вставьте реальные значения вместо ВСТАВЬТЕ_СЕКРЕТ.
+# Готовый файл не коммитится (.gitignore: config.*.local.toml), поэтому
+# секреты в git не попадут — в отличие от этого шаблона.
+# Прогон: python3 -m install_vps -c config.<хост>.local.toml --verify-only
+
+# Узел парка: dev.fly-server.ru (185.212.148.164), Ubuntu 26.04.1 «resolute»,
+# 1 vCPU (Xeon E5-2620 v3), 704 МБ RAM, 5.8 ГБ диска (2.1 ГБ свободно),
+# swapfile 512 МБ + zram 256 МБ, ядро 7.0.0-34-generic, IPv6 есть.
+#
+# Узел настраивался НЕ install-vps (полный прогон здесь никогда не выполнялся),
+# но состав хостов парка проверяется verify-all.sh, поэтому конфиг описывает
+# фактическое состояние. Раньше dev не был в списке вообще: шаблона не было —
+# и узел молча выпадал из проверок, как выпал бы любой новый хост.
+#
+# ВНИМАНИЕ, RAM: 704 МБ всего, свободно в моменте доходило до 22 МБ, zram
+# занят на 100%. Узел тянет пять контейнеров (caddy, dozzle, portainer-agent,
+# beszel-agent, чужой hp-thinpro-update). Полный прогон install-vps ради
+# ровно этого набора пакетов обменивать не стоит.
+#
+# Про Beszel: до 2026-10-03 агент был прописан на СВОЙ локальный хаб
+# (HUB_URL: http://localhost:8090) — машина два дня следила сама за собой, а
+# в UI монитора dev показывался офлайн. Хаб переехал на dc, поэтому агент
+# переключён на beszel_hub_url и смотрит в общий мониторинг.
+# Ключ и токен на dev уже были верными — база переехала с dev вместе с ними.
+
+host = "dev.fly-server.ru"
+user = "root"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+accept_new = true
+
+packages = ['nload', 'htop', 'btop', 'mc', 'git', 'procps', 'docker.io', 'docker-compose-v2', 'fail2ban', 'ncdu', 'logrotate']
+docker_source = 'ubuntu'
+# При official (docker-ce с download.docker.com) нужен
+# apt_hold_packages = ['docker-ce', 'docker-ce-cli']: без него apt upgrade
+# увозит docker на новый major. При ubuntu пинить нельзя — заблокирует
+# обновления безопасности.
+
+swap_size_mb = 512
+zram_size_mb = 256
+journald_max_use = '100M'
+docker_log_max_size = '10m'
+docker_log_max_file = 3
+
+# Мониторинг: только агент, входящий 45876 открывать не нужно — соединение
+# инициирует агент исходящим WebSocket к хабу на dc. Локального хаба на узле
+# больше нет, поэтому beszel_path (плитка /monitor) тут не используется: для
+# beszel_mode = "agent" она и не добавляется автоматически.
+beszel = true
+beszel_mode = "agent"
+beszel_agent_port = 45876
+beszel_hub_url = "https://monitor.fly-server.ru"
+
+# Логи контейнеров
+dozzle = true
+dozzle_port = 8082
+dozzle_path = '/logs'
+dozzle_user = 'admin'
+
+# Portainer CE: edge-агент, окружение уже создано на сервере dc
+portainer = true
+portainer_mode = "agent"
+portainer_version = "2.45.1"
+portainer_agent_edge_id = "ВСТАВЬТЕ_UUID_ОКРУЖЕНИЯ"
+portainer_agent_edge_key = "ВСТАВЬТЕ_СЕКРЕТ"
+
+# HTTPS + портал
+caddy = true
+caddy_email = 'pavel.pimenov@gmail.com'
+caddy_portal = "dev.fly-server.ru"
+caddy_portal_title = "Сервисы"
+# Плитка Мониторинг — внешняя ссылка на общий хаб: сам домен
+# monitor.fly-server.ru обслуживает dc, и на dev его поднимать нельзя
+# (указатель домена один, второй Caddy перехватит запросы не туда).
+caddy_tiles = [
+    "Мониторинг=https://monitor.fly-server.ru",
+    "ThinPro=https://thinpro.fly-server.ru",
+]
+
+# Сайта thinpro.fly-server.ru в caddy_sites нет СПЕЦИАЛЬНО, хотя файл
+# /opt/caddy/sites/thinpro.fly-server.ru.caddy на хосте лежит:
+#   - он сделан руками, install-vps его не писал и поддерживать не умеет;
+#   - апстрим (контейнер hp-thinpro-update) unhealthy, запросы висят;
+#   - маппинг порта сломан: `8000/tcp -> [{invalid IP 8080}]`, поэтому 8080
+#     открыт в интернет напрямую, мимо Caddy и его авторизации.
+# Если объявить его в caddy_sites, verify-all будет красным по вине чужого
+# приложения, а полный прогон перепишет файл. Плитка ThinPro выше — просто
+# ссылка, она не опрашивается и остаётся, как на хосте. Сайт не удаляется:
+# установщик пишет только свои файлы, чужие не трогает.
+
+# Beszel: пары key/token получены скриптовой провижининг-процедурой
+# (см. README, раздел про Beszel), в UI их копировать не нужно.
+beszel_agent_key = "ВСТАВЬТЕ_СЕКРЕТ"
+beszel_agent_token = "ВСТАВЬТЕ_СЕКРЕТ"
+
+# dozzle_password и portal_password в боевом конфиге НЕ заданы намеренно:
+# на узле уже записаны bcrypt-хэши, а исходные пароли восстановить нельзя.
+# Полный прогон с «угаданным» паролем переписал бы users.yml и portal.caddy
+# и отрезал доступ к логам и порталу, поэтому verify их не проверяет.

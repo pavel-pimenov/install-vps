@@ -351,6 +351,26 @@ def _static_options(options: str) -> dict[str, list[str]]:
     return parsed
 
 
+def _browse_flag(opts: dict[str, list[str]], paths: list[str]) -> bool:
+    """Листинг на весь сайт, а не точечный.
+
+    При `browse=/путь/` листинг точечный, и любой блок, который не `@listing`,
+    его выключать обязан — иначе откроется всё дерево торрентов.
+    """
+    return "browse" in opts and not paths
+
+
+def _listing_paths(paths: list[str], legacy: list[str]) -> list[str]:
+    """Пути листинга, продублированные с legacy-префиксом.
+
+    `@listing` сопоставляется с исходным URI, а `uri strip_prefix` переписывает
+    его уже позже. Поэтому клиент, привыкший к `/etc/install/`, под `@listing`
+    с одним лишь `/install/` не попадал — листинг молча не открывался.
+    Берём оба написания.
+    """
+    return [prefix.rstrip("/") + path for prefix in legacy for path in paths]
+
+
 def _caddy_static_block(
     cfg: Config, domain: str, root: str, options: dict[str, list[str]] | None = None
 ) -> str:
@@ -418,13 +438,22 @@ def _caddy_static_block(
     # угадывать, а handle без нужды только добавляет мест, где что-то может
     # не сработать.
     blocks: list[tuple[str, bool, str]] = []
+    whole_site_browse = _browse_flag(opts, paths)
     for num, prefix in enumerate(legacy):
         matcher = "@legacy" if len(legacy) == 1 else f"@legacy{num}"
         lines.append(f"\t{matcher} path " + " ".join(path_patterns([prefix])))
-        blocks.append((matcher, "browse" in opts, prefix))
+# Листинг в legacy-поддереве разрешаем только если он был на весь сайт.
+        # При `browse=/путь/` он точечный, а включать его здесь нельзя: значило
+        # бы раскрыть всё дерево списком — ровно то, чего требует избегать
+        # точечного `browse=/путь/`.
+        blocks.append((matcher, whole_site_browse, prefix))
     if paths:
-        lines.append("\t@listing path " + " ".join(path_patterns(paths)))
-        blocks.append(("@listing", True, ""))
+        # Матчер листинга обязан стоять ПЕРЕД legacy-блоками: `@legacy` совпадает
+        # и с `/etc/install/`, и перехватил бы такой запрос первым, а листинга
+        # в нём при точечном `browse=/путь/` нет — каталог просто не открылся бы.
+        lines.append("\t@listing path "
+                     + " ".join(path_patterns(paths + _listing_paths(paths, legacy))))
+        blocks.insert(0, ("@listing", True, ""))
     if blocks:
         if deny:
             # `respond` упорядочен после `handle`, поэтому снаружи он не
@@ -433,7 +462,7 @@ def _caddy_static_block(
             lines.append("\thandle @forbidden {")
             lines.append("\t\trespond 403")
             lines.append("\t}")
-        for matcher, browse, strip in [*blocks, ("", browse_flag(opts, paths), "")]:
+        for matcher, browse, strip in [*blocks, ("", whole_site_browse, "")]:
             lines.append("\t" + (f"handle {matcher}" if matcher else "handle") + " {")
             if strip:
                 # стрип legacy-префикса — первой директивой блока: иначе
@@ -448,15 +477,6 @@ def _caddy_static_block(
         lines.extend(file_server_lines("browse" in opts, "\t"))
     lines.append("\tencode gzip")
     return f"{domain} {{\n" + _access_log_block(cfg) + "\n".join(lines) + "\n}\n"
-
-
-def browse_flag(opts: dict, paths: list[str]) -> bool:
-    """Листинг в catch-all: только когда он задан на весь сайт.
-
-    При `browse=/путь/` листинг точечный, и catch-all (всё остальное) его
-    выключать обязан — иначе откроется всё дерево торрентов.
-    """
-    return "browse" in opts and not paths
 
 
 def _access_log_block(cfg: Config) -> str:
@@ -579,7 +599,15 @@ def _write_site_script(name: str, content: str) -> str:
     руками (правка Caddy, миграция lighttpd), и откат после неудачного прогона
     иначе означал бы дописывание конфига заново. Копия делается только если
     содержимое реально меняется — иначе каждый идемпотентный повторный прогон
-    плодил бы одинаковые копии. Хранятся последние {SITE_BACKUP_KEEP} срезов.
+    плодил бы одинаковые копии. Хранятся последние {SITE_BACKUP_KEEP} *дней*:
+    по одному срезу на день, самый новый из них.
+
+    Считать надо дни, а не запуски: пять прогонов за вечер вытесняли всю
+    историю за месяц, и настоящие срезы — как раз те, что делались вручную
+    перед правкой Caddy, — исчезали первыми. Имена каталогов
+    `YYYYmmdd-HHMMSS` сортируются лексикографически в том же порядке, что и по
+    времени, поэтому порядок не зависит от mtime. Каталог с не-меткой времени
+    не удаляется никогда: удалять наугад нельзя.
 
     Сравнение идёт по содержимому без секретов (см. `site_norm` в
     `_bootstrap`): в черновике вместо хэша пароля стоит `__PORTAL_HASH__`
@@ -611,11 +639,20 @@ def _write_site_script(name: str, content: str) -> str:
         f"    $SUDO cp -a {CADDY_SITES_DIR}/{name}.caddy \"$backup/\" 2>/dev/null || true\n"
         "  fi\n"
         f"  $SUDO tee {CADDY_SITES_DIR}/{name}.caddy < {new_tmp} >/dev/null\n"
-        f"  $SUDO rm -f {new_tmp}\n"
-        "  # старые срезы: храним последние "
-        f"{SITE_BACKUP_KEEP}, старше — сносим\n"
-        f"  $SUDO ls -1dt {CADDY_SITES_DIR}.bak/*/ 2>/dev/null | tail -n +{SITE_BACKUP_KEEP + 1}"
-        f" | $SUDO xargs -r rm -rf\n"
+f"  rm -f {new_tmp}\n"
+        "  # старые срезы: держим последние "
+        f"{SITE_BACKUP_KEEP} ДНЕЙ по одному срезу на день\n"
+        f"  $SUDO ls -1d {CADDY_SITES_DIR}.bak/*/ 2>/dev/null | sed 's|/*$||' | sort -r "
+        "| awk -v keep="
+        f"{SITE_BACKUP_KEEP} "
+        "'{ n = split($0, p, \"/\"); name = p[n]; "
+        # каталог без метки времени не удаляем никогда: удалять наугад нельзя
+        "if (name !~ /^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]$/) next; "
+        "day = substr(name, 1, 8); "
+        "if (!(day in seen)) { seen[day] = 1; days++; keepday = (days <= keep) } "
+        "else keepday = 0; "  # день уже учтён — держим только самый новый срез
+        "if (!keepday) print $0 }' "
+        f"| $SUDO xargs -r rm -rf\n"
         "fi\n"
     )
 
@@ -1441,7 +1478,8 @@ CADDY_COMPOSE = "/opt/caddy/docker-compose.yml"
 CADDY_SITES_DIR = "/opt/caddy/sites"
 # копии прошлых версий сайтов: sites.bak/<метка времени>/<домен>.caddy
 CADDY_SITES_BACKUP_DIR = f"{CADDY_SITES_DIR}.bak"
-# сколько последних срезов храним — хватает для отката, но не съедает диск
+# сколько последних ДНЕЙ храним — хватает для отката, но не съедает диск.
+# Именно дней, а не запусков: иначе пять прогонов за вечер вытесняют историю
 SITE_BACKUP_KEEP = 5
 # внутри контейнера sites/ примонтирован в /etc/caddy/sites — Caddyfile
 # пишется и читается уже по контейнерному пути
@@ -2105,11 +2143,22 @@ def _caddy_site_check_script(cfg: Config) -> str:
         "check_site() {",
         '  domain="$1"; kind="$2"',
         "  code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \\",
-        '    --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null)',
+        # || true обязателен: под set -e код возврата curl попадает в
+        # присваивание, и таймаут (28) убил бы весь прогон verify молча,
+        # не дойдя до case. Так ломался сайт thinpro на dev: висел апстрим —
+        # и хост возвращал код 28 без единой строки ПРОБЛЕМА.
+        '    --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)',
         '  case "$code" in',
         "    2*|3*) echo \"  OK: https://$domain/ -> $code\" ;;",
-        '    000|"") echo "  WARN: https://$domain/ не ответил — сертификат не выпущен'
-        ' или Caddy не перечитал конфиг" ;;',
+        # у прокси-сайта код 000 — это оборванный апстрим, а не сертификат:
+        # Caddy здесь ни при чём, виноват контейнер за ним
+        '    000|"") if [ "$kind" = proxy ]; then',
+        '           echo "  ПРОБЛЕМА: https://$domain/ не ответил (код 000) —'
+        ' upstream не отвечает"',
+        "         else",
+        '           echo "  WARN: https://$domain/ не ответил — сертификат не выпущен'
+        ' или Caddy не перечитал конфиг"',
+        "       fi ;;",
         '    404) if [ "$kind" = static ]; then',
         '           echo "  ПРОБЛЕМА: https://$domain/ -> 404: каталог пуст, нет'
         ' index-файла и не задан листинг (browse или browse=/путь/)"',
@@ -2122,7 +2171,7 @@ def _caddy_site_check_script(cfg: Config) -> str:
         "check_browse() {",
         '  domain="$1"; path="$2"',
         "  code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \\",
-        '    --resolve "$domain:443:127.0.0.1" "https://$domain$path" 2>/dev/null)',
+        '    --resolve "$domain:443:127.0.0.1" "https://$domain$path" 2>/dev/null || true)',
         '  case "$code" in',
         "    2*|3*) echo \"  OK: https://$domain$path -> $code (листинг)\" ;;",
         '    000|"") echo "  WARN: https://$domain$path не ответил" ;;',
@@ -2160,7 +2209,9 @@ def _must_serve_check_script(cfg: Config) -> str:
         "check_must_serve() {",
         '  domain="$1"; path="$2"',
         "  code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' \\",
-        '    --resolve "$domain:443:127.0.0.1" "https://$domain$path" 2>/dev/null)',
+        # тот же || true, что и в check_site: иначе таймаут по файлу из
+        # caddy_must_serve ронял бы прогон целиком (см. AGENTS.md, п. 17)
+        '    --resolve "$domain:443:127.0.0.1" "https://$domain$path" 2>/dev/null || true)',
         '  case "$code" in',
         "    2*|3*) echo \"  OK: https://$domain$path -> $code\" ;;",
         '    000|"") echo "  WARN: https://$domain$path не ответил — Caddy не'

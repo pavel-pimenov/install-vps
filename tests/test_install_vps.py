@@ -80,6 +80,22 @@ def bash_check(script: str) -> None:
         raise AssertionError(f"bash -n не прошёл:\n{proc.stderr}\n---\n{script}")
 
 
+def _joined_commands(script: str) -> list[str]:
+    """Строки bash, склеенные переносом `\\`: одна команда = один элемент."""
+    commands: list[str] = []
+    buf = ""
+    for line in script.splitlines():
+        buf += line.rstrip()
+        if buf.endswith("\\"):
+            buf = buf[:-1]
+            continue
+        commands.append(buf)
+        buf = ""
+    if buf:
+        commands.append(buf)
+    return commands
+
+
 class ConfigTests(unittest.TestCase):
     def test_load_config_rejects_unknown_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1205,6 +1221,69 @@ class StaticSiteTests(unittest.TestCase):
         self.assertIn("cmp -s", script)
         self.assertIn("rm -f /opt/caddy/.sites-new/www.example.com.caddy", script)
 
+    def _rotation_filter(self) -> str:
+        """awk-фильтр ротации из реального шаблона, без `xargs rm -rf`.
+
+        Хвост с `rm` отрезается, и это проверяется: тест не должен уметь
+        ничего удалять, даже если кто-то переставит `rm` внутрь фильтра.
+        """
+        script = installer._caddy_sites_script(full_config(
+            caddy_sites=["www.example.com=file:/var/www"]))
+        line = [s for s in script.splitlines() if "awk" in s and "keep=" in s]
+        self.assertEqual(len(line), 1, "ожидалась ровно одна строка ротации")
+        self.assertIn("xargs -r rm -rf", line[0], "на хосте удаляет xargs")
+        filt = "sed " + line[0].split("sed ", 1)[1].split("}'", 1)[0] + "}'"
+        self.assertNotIn("xargs", filt)
+        self.assertNotIn("rm", filt)
+        self.assertIn(f"keep={installer.SITE_BACKUP_KEEP}", filt)
+        return filt
+
+    def _rotate(self, labels: list[str]) -> tuple[list[str], list[str]]:
+        head, awk = self._rotation_filter().split("awk -v ", 1)
+        proc = subprocess.run(["bash", "-c", f"{head}awk -v {awk}"],
+                              input="\n".join(
+                                  f"{installer.CADDY_SITES_DIR}.bak/{x}/" for x in labels),
+                              capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        deleted = [x.rsplit("/", 1)[-1] for x in proc.stdout.split()]
+        return [x for x in labels if x not in deleted], deleted
+
+    def test_rotation_keeps_days_not_runs(self) -> None:
+        """Пять прогонов за вечер не должны съесть историю за месяц."""
+        kept, deleted = self._rotate([
+            "20261002-220000", "20261002-230000", "20261002-235959",
+            "20261001-120000", "20260930-120000",
+            "20260929-120000", "20260928-120000", "20260927-120000",
+        ])
+        # по одному, самому новому срезу за каждый из пяти последних дней
+        self.assertEqual(kept, ["20261002-235959", "20261001-120000",
+                                "20260930-120000", "20260929-120000",
+                                "20260928-120000"])
+        # более старые срезы тех же дней тоже уходят
+        self.assertIn("20261002-220000", deleted)
+        self.assertIn("20260927-120000", deleted)
+
+    def test_rotation_deletes_nothing_when_history_is_short(self) -> None:
+        kept, deleted = self._rotate(["20261002-120000", "20261001-120000"])
+        self.assertEqual(deleted, [])
+        self.assertEqual(len(kept), 2)
+
+    def test_rotation_never_deletes_directory_without_timestamp(self) -> None:
+        """Каталог, названный не по шаблону, удалять наугад нельзя."""
+        kept, deleted = self._rotate(
+            ["20260901-120000", "20260831-120000", "20260830-120000",
+             "20260829-120000", "20260828-120000", "старая-копия"])
+        self.assertIn("старая-копия", kept)
+        self.assertNotIn("старая-копия", deleted)
+
+    def test_rotation_sorts_by_label_not_mtime(self) -> None:
+        """Метка YYYYmmdd-HHMMSS сортируется как время — mtime не нужен."""
+        script = installer._caddy_sites_script(full_config(
+            caddy_sites=["www.example.com=file:/var/www"]))
+        self.assertIn("ls -1d", script)
+        self.assertNotIn("ls -1dt", script)
+
     def test_site_norm_reads_root_file_on_sudo_host(self) -> None:
         # `$SUDO cat` внутри `<(...)` не работает: в redirect-слове bash не делает
         # word splitting и искал файл с именем "sudo" — тогда сравнение всегда
@@ -1249,9 +1328,11 @@ class StaticSiteTests(unittest.TestCase):
         self.assertFalse(same(body + hash_a, body.replace("hi", "bye") + hash_a))
 
     def test_old_site_backups_pruned(self) -> None:
+        # Ротация по дням: пять последних дней, а не пять последних запусков
         script = installer._caddy_sites_script(full_config(
             caddy_sites=["www.example.com=file:/var/www"]))
-        self.assertIn(f"tail -n +{installer.SITE_BACKUP_KEEP + 1}", script)
+        self.assertIn(f"awk -v keep={installer.SITE_BACKUP_KEEP}", script)
+        self.assertNotIn(f"tail -n +{installer.SITE_BACKUP_KEEP + 1}", script)
 
     def test_site_draft_outside_served_dir(self) -> None:
         # sites/ смонтирован в контейнер и подключён import *.caddy — черновик
@@ -1732,6 +1813,38 @@ class SiteProbeTests(unittest.TestCase):
         # хвост опций не должен попасть в пробу
         self.assertNotIn("browse", script.split('check_site "etc.example.com"')[1])
 
+    def test_probe_tolerates_curl_failure(self) -> None:
+        """Таймаут curl не должен ронять весь прогон verify.
+
+        Под set -e код возврата подстановки попадает в присваивание, поэтому
+        висящий апстрим (curl → 28) убивал скрипт молча: хост возвращал код 28
+        без единой строки ПРОБЛЕМА. Так вёл себя thinpro на dev.
+        """
+        cfg = self._cfg(caddy_must_serve=["etc.example.com=/file.lua"])
+        scripts = {
+            "check_site": installer._caddy_site_check_script(cfg),
+            "check_browse": installer._caddy_site_check_script(cfg),
+            "check_must_serve": installer._must_serve_check_script(cfg),
+        }
+        for name, script in scripts.items():
+            with self.subTest(probe=name):
+                bash_check(f"{name}() {{ :; }}\n" + script)
+                probes = _joined_commands(script)
+                probes = [p for p in probes if "$(curl" in p]
+                self.assertTrue(probes, f"{name}: проб не найдено")
+                for probe in probes:
+                    self.assertIn("|| true", probe)
+
+    def test_proxy_no_answer_is_problem(self) -> None:
+        """Код 000 у прокси-сайта — оборванный апстрим, а не сертификат."""
+        script = installer._caddy_site_check_script(self._cfg())
+        branch = script.split('000|"")')[1].split(";;")[0]
+        self.assertIn('if [ "$kind" = proxy ]', branch)
+        self.assertIn("ПРОБЛЕМА", branch)
+        self.assertIn("upstream не отвечает", branch)
+        # у статики 000 — это TLS/Caddy, там остаётся WARN
+        self.assertIn("WARN", branch)
+
     def test_static_404_mentions_index(self) -> None:
         script = installer._caddy_site_check_script(self._cfg())
         self.assertIn("каталог пуст, нет index-файла и не задан листинг", script)
@@ -1961,7 +2074,8 @@ class LighttpdAuditTests(unittest.TestCase):
     #url.access-deny = ( "" )
     """
 
-    DENY = ["*.inc", "*.php", "*.pl", "*.fcgi"]
+    # «~» из url.access-deny lighttpd — это тоже запрет: у Caddy «*~»
+    DENY = ["*.inc", "*.php", "*.pl", "*.fcgi", "*~"]
 
     def _sites(self, *specs: tuple[str, str, list[str]]) -> list:
         return [(domain, root, opts) for domain, root, opts in specs]
@@ -2003,12 +2117,33 @@ class LighttpdAuditTests(unittest.TestCase):
         ))
         self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.LOST)
 
-    def test_deny_dot_php_form_accepted(self) -> None:
-        # '.php' в lighttpd и '*.php' в Caddy — одно правило, записанное иначе
+    def test_deny_without_wildcard_is_not_equivalent(self) -> None:
+        """`.php` в Caddy совпадает ровно с путём «.php», а не с upload.php.
+
+        Прежняя проверка считала `.php` и `*.php` одним правилом и молча
+        пропускала конфиг, в котором лежащий в дереве upload.php отдавался
+        как 200 — то есть аудит врал ровно в том случае, когда запрет не
+        работал.
+        """
         rules = lighttpd.audit(self.LTPD, self._sites(
-            ("www.example.com", "/var/www", {"deny": [".php", ".pl", ".fcgi", ".inc"]}),
+            ("www.example.com", "/var/www",
+             {"deny": [".php", "*.pl", "*.fcgi", "*.inc", "*~"]}),
         ))
-        self.assertEqual(self._rule(rules, "доступ к исполняемым файлам").level, lighttpd.OK)
+        rule = self._rule(rules, "доступ к исполняемым файлам")
+        self.assertEqual(rule.level, lighttpd.LOST)
+        self.assertIn("*.php", rule.hint)
+
+    def test_backup_tilde_denied_by_lighttpd_is_required(self) -> None:
+        """url.access-deny = ("~", ...) — правило про бэкапы, а не про расширения."""
+        patterns = lighttpd._deny_patterns(lighttpd._uncommented(self.LTPD))
+        self.assertIn("*~", patterns)
+        rules = lighttpd.audit(self.LTPD, self._sites(
+            ("etc.example.com", "/var/www/etc",
+             {"deny": ["*.inc", "*.php", "*.pl", "*.fcgi"], "legacy": ["/etc"]}),
+        ))
+        rule = self._rule(rules, "доступ к исполняемым файлам")
+        self.assertEqual(rule.level, lighttpd.LOST)
+        self.assertIn("*~", rule.hint)
 
     def test_whole_site_browse_is_lost_rule(self) -> None:
         # lighttpd гасил листинг для /etc и /update, а не для сайта целиком
@@ -2168,6 +2303,15 @@ class LighttpdAuditTests(unittest.TestCase):
         ))
         self.assertEqual(self._rule(rules, "заголовки mod_setenv").level, lighttpd.OK)
 
+    def test_header_not_required_for_site_outside_doc_root(self) -> None:
+        """Сайт вообще вне дерева lighttpd правилами не охватывается."""
+        rules = lighttpd.audit(self.LTPD_SETENV, self._sites(
+            ("other.example.com", "/srv/other", {"browse": []}),
+            ("pvs.example.com", "/var/www/pvs-studio",
+             {"browse": [], "header": self.SETENV}),
+        ))
+        self.assertEqual(self._rule(rules, "заголовки mod_setenv").level, lighttpd.OK)
+
     def test_header_not_required_on_unrelated_mirror(self) -> None:
         """На зеркале /var/www/etc запроса /pvs-studio/ не бывает.
 
@@ -2195,6 +2339,30 @@ class LighttpdAuditTests(unittest.TestCase):
             ("etc.example.com", "/var/www/etc", {"browse": [], "legacy": ["/etc"]}),
         ))
         self.assertEqual(self._rule(rules, "legacy-префиксы URL").level, lighttpd.OK)
+
+    def test_legacy_prefix_empty_for_root_outside_doc_root(self) -> None:
+        """Сайт вне дерева lighttpd не имеет старого URL-префикса."""
+        self.assertEqual(lighttpd._legacy_prefix("/srv/other", "/var/www"), "")
+        self.assertEqual(lighttpd._legacy_prefix("", "/var/www"), "")
+        self.assertEqual(lighttpd._legacy_prefix("/var/www", "/var/www"), "")
+        # /var/www-other начинается с префикса, но не входит в дерево
+        self.assertEqual(lighttpd._legacy_prefix("/var/www-other", "/var/www"), "")
+
+    def test_setenv_block_without_headers_is_ignored(self) -> None:
+        """Условие может быть в конфиге, а заголовков в нём не задано."""
+        self.assertEqual(lighttpd._setenv_headers('$HTTP["url"] =~ "^/pvs/" {}\n'), [])
+        text = '$HTTP["url"] =~ "^/pvs/" {\n    # комментарий\n}\n'
+        self.assertEqual(lighttpd._setenv_headers(text), [])
+
+    def test_deny_pattern_ignores_empty_token(self) -> None:
+        """`url.access-deny = ( "" )` — выключалка, а не запрет пустого имени."""
+        patterns = lighttpd._deny_patterns(['url.access-deny = ( "" )'])
+        self.assertNotIn("**", patterns)
+        self.assertEqual(patterns, sorted(f"*{e}" for e in lighttpd._DEFAULT_DENY))
+
+    def test_deny_pattern_keeps_ready_wildcard(self) -> None:
+        self.assertIn("*.bak",
+                      lighttpd._deny_patterns(['url.access-deny = ( "*.bak" )']))
 
     def test_no_legacy_rule_when_roots_equal_doc_root(self) -> None:
         rules = lighttpd.audit(self.LTPD, self._sites(

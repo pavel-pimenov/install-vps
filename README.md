@@ -292,7 +292,15 @@ lighttpd действовало на весь `server.document-root`, а зер�
 
 ```bash
 sh scripts/audit-lighttpd.sh -c config.dc.local.toml
+# то же самое, если скрипт не под рукой:
+python3 -m install_vps.audit -c config.dc.local.toml
 ```
+
+Скрипт — тонкая обёртка: вся логика в `install_vps/audit.py` (чтение по SSH
+и разбор ответа) и `install_vps/lighttpd.py` (собственно правила). Раньше она
+жила heredoc'ом внутри `.sh`, её не видел ни ruff, ни тесты — и как раз там
+пряталась ошибка с одинаковыми сообщениями для отказа ssh и отсутствия
+lighttpd.
 
 ```
 аудит lighttpd -> Caddy:

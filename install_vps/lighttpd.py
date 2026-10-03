@@ -12,11 +12,24 @@
 неперенесённых правил на выходе. Ничего не ходит по SSH — это делает
 `scripts/audit-lighttpd.sh`.
 
+Проверяемые правила (каждое — отдельный `Rule` в отчёте):
+
+* `url.access-deny` + `static-file.exclude-extensions` -> `deny=`;
+* вложенный корень сайта -> `legacy=` (URL-префикс, по которому ходил клиент);
+* `mod_setenv` -> `header=` / `header=/путь/*=`;
+* `dir-listing.activate` -> `browse`;
+* точечное `server.dir-listing = "disable"` -> `browse=/путь/`;
+* `index-file.names` -> `index=`.
+
 Ключевая тонкость: правила lighttpd действовали на `server.document-root`
 (на dc — `/var/www`), а зеркала в Caddy — отдельные домены со своими корнями
-(`/var/www/etc`, `/var/www/update`...). Поэтому «листинг выключен для /etc»
-значит «не для всего сайта», и проверять это надо на сайте корня, а не на
-всех зеркалах сразу: у зеркал листинг наоборот нужен.
+(`/var/www/etc`, `/var/www/update`...). Отсюда две тонкости сразу:
+
+* «листинг выключен для /etc» значит «не для всего сайта», и проверять это
+  надо на сайте корня, а не на всех зеркалах: у зеркал листинг наоборот нужен;
+* правило, адресованное пути (`/etc/файл`, `/pvs-studio/`), на зеркале может
+  быть неприменимо вовсе, поэтому требование распространяется только на те
+  сайты, где этот путь реально обслуживается.
 """
 
 from __future__ import annotations
@@ -52,18 +65,14 @@ class Rule:
     hint: str = ""  # чем закрыть, если не покрыто
 
 
-def _covers_deny(options: dict[str, list[str]], extensions: list[str]) -> bool:
-    """Закрывает ли deny все расширения из lighttpd.
+def _covers_deny(options: dict[str, list[str]], patterns: list[str]) -> bool:
+    """Закрывает ли deny все шаблоны из lighttpd.
 
-    Сравнение по расширению, а не по строке: `*.php` в Caddy и `.php` в
+    Сравнение по шаблону, а не по строке: `*.php` в Caddy и `.php` в
     lighttpd — одно и то же правило, записанное по-разному.
     """
     deny = set(options.get("deny") or ())
-    for raw_ext in extensions:
-        ext = raw_ext if raw_ext.startswith(".") else f".{raw_ext}"
-        if not deny & {f"*{ext}", ext, f"*{ext.lstrip('.')}"}:
-            return False
-    return True
+    return all(pattern in deny for pattern in patterns)
 
 
 def _uncommented(text: str) -> list[str]:
@@ -110,17 +119,29 @@ def _index_names(lines: list[str]) -> list[str]:
     return names
 
 
-def _denied_extensions(lines: list[str]) -> list[str]:
-    """Расширения из url.access-deny и static-file.exclude-extensions."""
-    found = {_DEFAULT_DENY[0]}  # .inc из url.access-deny проверяем отдельно ниже
+def _deny_patterns(lines: list[str]) -> list[str]:
+    """Шаблоны `deny=`, которые lighttpd требовал, в терминах Caddy.
+
+    Два источника, оба действовали глобально на `document-root`:
+
+    * `url.access-deny = ( "~", ".inc" )` — кроме расширений там лежат
+      литеральные шаблоны вроде `"~"` (бэкапы вида `config.php~`). Это не
+      расширение, и прежний разбор их отбрасывал, из-за чего `*~` не
+      проверялся вовсе: зеркала годами держали `deny=` без него;
+    * `static-file.exclude-extensions = ( ".php", ".pl", ".fcgi" )`.
+    """
+    patterns = {f"*{ext}" for ext in _DEFAULT_DENY}
     for line in lines:
         m = re.search(r'url\.access-deny\s*=\s*\(?\s*(.+?)\s*\)?$', line)
         if m:
-            found |= {f".{ext}" for ext in re.findall(r'"\.([A-Za-z0-9]+)"', m.group(1))}
+            for token in re.findall(r'"([^"]*)"', m.group(1)):
+                if not token:
+                    continue
+                patterns.add(token if token.startswith("*") else f"*{token}")
         m = re.search(r'static-file\.exclude-extensions\s*=\s*\(?\s*(.+?)\s*\)?$', line)
         if m:
-            found |= {f".{ext}" for ext in re.findall(r'"\.?([A-Za-z0-9]+)"', m.group(1))}
-    return sorted(found | set(_DEFAULT_DENY))
+            patterns |= {f"*.{ext}" for ext in re.findall(r'"\.?([A-Za-z0-9]+)"', m.group(1))}
+    return sorted(patterns)
 
 
 def _under_root(root: str, doc_root: str) -> bool:
@@ -130,8 +151,8 @@ def _under_root(root: str, doc_root: str) -> bool:
     return root == doc_root or root.startswith(doc_root + "/")
 
 
-def _deny_need(extensions: list[str]) -> str:
-    return "добавьте |deny=" + ",".join(f"*{ext}" for ext in extensions) + " к caddy_site"
+def _deny_need(patterns: list[str]) -> str:
+    return "добавьте |deny=" + ",".join(patterns) + " к caddy_site"
 
 
 def _rule_deny(lines: list[str], sites: list[tuple[str, str, dict]], doc_root: str) -> Rule:
@@ -141,10 +162,10 @@ def _rule_deny(lines: list[str], sites: list[tuple[str, str, dict]], doc_root: s
     на каждом сайте этого дерева, а не хотя бы на одном. Иначе `upload.php`,
     лежащий в подкаталоге зеркала, снова уедет в 200.
     """
-    extensions = _denied_extensions(lines)
+    patterns = _deny_patterns(lines)
     tree = [(domain, opts) for domain, root, opts in sites if _under_root(root, doc_root)]
-    uncovered = [domain for domain, opts in tree if not _covers_deny(opts, extensions)]
-    what = ("lighttpd не отдавал " + ", ".join(extensions)
+    uncovered = [domain for domain, opts in tree if not _covers_deny(opts, patterns)]
+    what = ("lighttpd не отдавал " + ", ".join(patterns)
             + " (url.access-deny / static-file.exclude-extensions)")
     if not sites:
         return Rule("доступ к исполняемым файлам", what, WARN,
@@ -152,7 +173,7 @@ def _rule_deny(lines: list[str], sites: list[tuple[str, str, dict]], doc_root: s
     if not uncovered:
         return Rule("доступ к исполняемым файлам", what, OK)
     if len(uncovered) == len(tree):
-        return Rule("доступ к исполняемым файлам", what, LOST, _deny_need(extensions))
+        return Rule("доступ к исполняемым файлам", what, LOST, _deny_need(patterns))
     return Rule("доступ к исполняемым файлам", what, WARN,
                 "на этих сайтах deny= закрывает меньше, чем lighttpd: " + ", ".join(uncovered)
                 + " (исполняемые файлы из дерева отдаются как обычные)")
@@ -219,9 +240,11 @@ def _rule_index(lines: list[str], sites: list[tuple[str, str, dict]]) -> Rule | 
     raw_names = _index_names(lines)
     if not raw_names:
         return None
-    extensions = _denied_extensions(lines)
+    # интересуют только запрещённые расширения: литеральные шаблоны вроде
+    # «*~» индексным файлам не соответствуют
+    denied_exts = {p[1:] for p in _deny_patterns(lines) if p.startswith("*.")}
     names = [n for n in raw_names
-             if f".{n.rsplit('.', 1)[-1]}" not in extensions and n != _LIGHTTPD_ARTIFACT]
+             if f".{n.rsplit('.', 1)[-1]}" not in denied_exts and n != _LIGHTTPD_ARTIFACT]
     skipped = [n for n in raw_names if n not in names]
     what = ("lighttpd: index-file.names = " + ", ".join(raw_names)
             + (f" (в Caddy не переносятся: {', '.join(skipped)})" if skipped else ""))
@@ -235,17 +258,6 @@ def _rule_index(lines: list[str], sites: list[tuple[str, str, dict]]) -> Rule | 
     return Rule("индексные файлы", what, WARN,
                 "на этих сайтах index= не покрывает lighttpd-индексы (" + ", ".join(names)
                 + "): каталог покажет листинг вместо индекса — " + ", ".join(without))
-
-
-def _denied_patterns(lines: list[str]) -> list[str]:
-    """Не-расширенные шаблоны url.access-deny — например «~» (баккапы)."""
-    found: set[str] = set()
-    for line in lines:
-        m = re.search(r'url\.access-deny\s*=\s*\(?\s*(.+?)\s*\)?$', line)
-        if m:
-            found |= {tok for tok in re.findall(r'"([^"]+)"', m.group(1))
-                      if not tok.startswith(".") and not tok.startswith("*")}
-    return sorted(found)
 
 
 def _legacy_prefix(root: str, doc_root: str) -> str:

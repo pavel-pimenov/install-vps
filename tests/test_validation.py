@@ -5,6 +5,7 @@ import io
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from install_vps import cli, installer, lighttpd  # noqa: E402
 from install_vps import ssh as installer_ssh  # noqa: E402
 from install_vps.cli import _parser  # noqa: E402
-from install_vps.config import Config, apply_overrides  # noqa: E402
+from install_vps.config import Config, apply_overrides, load_config  # noqa: E402
 from install_vps.installer import (  # noqa: E402
     _GITHUB_TOOLS,
     _beszel_auth_env,
@@ -231,6 +232,45 @@ class BeszelAuthEnvTests(unittest.TestCase):
         cfg = Config(beszel=True, caddy=True, caddy_portal="p.example.com",
                      caddy_domain="mon.example.com")
         self.assertEqual([t for t in _tiles(cfg) if t.beszel], [])
+
+
+class UnknownConfigKeyTests(unittest.TestCase):
+    """Опечатка в ключе конфига обязана падать, а не молча выключать раздел.
+
+    Иначе `caddy-sites` вместо `caddy_sites` даёт пустой список — установщик
+    радостно отчитается, а сайт не появится.
+    """
+
+    def _load(self, text: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(text, encoding="utf-8")
+            return load_config(path)
+
+    def test_typo_in_key_is_rejected(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            self._load('host = "h"\ncaddy-sites = []\n')
+        self.assertIn("caddy-sites", str(ctx.exception))
+
+    def test_typo_in_long_key_names_the_original(self) -> None:
+        """В сообщении нужен именно ошибочный ключ, иначе искать долго."""
+        with self.assertRaises(ValueError) as ctx:
+            self._load('host = "h"\nbeszel_agent_tokn = "x"\n')
+        self.assertIn("beszel_agent_tokn", str(ctx.exception))
+
+    def test_unknown_section_is_rejected(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            self._load('host = "h"\n[server]\nport = 1\n')
+        self.assertIn("server", str(ctx.exception))
+
+    def test_known_keys_and_empty_file_load(self) -> None:
+        cfg = self._load('host = "h"\nuser = "ppa"\nport = 2222\n')
+        self.assertEqual((cfg.host, cfg.user, cfg.port), ("h", "ppa", 2222))
+        self.assertEqual(self._load("").host, "")
+
+    def test_missing_file_is_not_an_error(self) -> None:
+        """`--config` может указывать на несуществующий файл — это не опечатка."""
+        self.assertEqual(load_config(Path("/nonexistent/config.toml")).host, "")
 
 
 class ValidateDomainTests(unittest.TestCase):
@@ -794,7 +834,7 @@ class MigrationConsistencyTests(unittest.TestCase):
         'url.access-deny             = ( "~", ".inc" )\n'
         'static-file.exclude-extensions = ( ".php", ".pl", ".fcgi" )\n'
     )
-    DENY = "deny=*.inc,*.php,*.pl,*.fcgi"
+    DENY = "deny=*.inc,*.php,*.pl,*.fcgi,*~"
 
     def _sites(self, cfg: Config) -> list:
         sites = []
@@ -860,6 +900,58 @@ class MigrationConsistencyTests(unittest.TestCase):
         self.assertEqual(deny_rule.level, lighttpd.LOST)
 
 
+class ModuleEntryPointTests(unittest.TestCase):
+    """`python3 -m install_vps` — строка, которую запускает человек.
+
+    Без покрытия она оставалась единственной непроверенной в cli.py, а это
+    ровно та точка входа, которой пользуются при ручном прогоне.
+    """
+
+    def test_module_help_exits_zero_without_network(self) -> None:
+        # --help выходит из argparse до чтения config.toml и до SSH, поэтому
+        # тест не ходит по сети даже при боевом конфиге в корне репозитория
+        proc = subprocess.run(
+            [sys.executable, "-m", "install_vps", "--help"],
+            capture_output=True, text=True, check=False, timeout=60,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--caddy-site", proc.stdout)
+
+    def test_cli_main_guard_executes_and_exits_zero(self) -> None:
+        """Строка `raise SystemExit(main())` в самом cli.py, а не в __main__.py.
+
+        Запускается настоящий исходник модуля с `__name__ = "__main__"`,
+        чтобы отработал именно его guard. `--help` выходит из argparse до
+        чтения config.toml и до SSH, поэтому сеть не затрагивается.
+        """
+        shadow = types.ModuleType("install_vps.cli_as_main")
+        shadow.__package__ = "install_vps"   # иначе относительный импорт не встанет
+        shadow.__name__ = "__main__"
+        shadow.__file__ = cli.__file__
+        argv, sys.argv = sys.argv, ["install_vps", "--help"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as ctx:
+                exec(compile(Path(cli.__file__).read_text(), cli.__file__, "exec"),
+                     shadow.__dict__)
+        finally:
+            sys.argv = argv
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("--caddy-site", buf.getvalue())
+
+    def test_module_without_args_would_use_repo_config(self) -> None:
+        """Строка входа читает config.toml — это документированное поведение.
+
+        Проверяем без запуска SSH: сам факт, что путь конфига зашит в main()
+        и по умолчанию config.toml, а не None.
+        """
+        source = (Path(__file__).resolve().parent.parent
+                  / "install_vps" / "cli.py").read_text()
+        self.assertIn('default=Path("config.toml")', source)
+        self.assertIn("raise SystemExit(main())", source)
+
+
 class LegacyPrefixTests(unittest.TestCase):
     """Старый document-root = /var/www: клиенты ходят по /etc/файл.
 
@@ -913,6 +1005,47 @@ class LegacyPrefixTests(unittest.TestCase):
         block = self._block("browse|legacy=/etc/")
         self.assertIn("@legacy path /etc /etc/ /etc/*", block)
         self.assertIn("uri @legacy strip_prefix /etc\n", block + "\n")
+
+    def test_scoped_browse_does_not_open_whole_legacy_tree(self) -> None:
+        """`browse=/install/` + `legacy=/etc` не должны дать листинг всего дерева.
+
+        Листинг включается только в `@listing`. В legacy-блоке его быть не
+        должно — это раскрыло бы всё дерево зеркала списком, то есть ровно то,
+        ради чего `browse=/путь/` и заводился.
+        """
+        block = self._block("browse=/install/|legacy=/etc")
+        legacy = block[block.index("handle @legacy {"):block.index("handle {\n\t\tfile_server")]
+        self.assertIn("file_server\n", legacy)
+        self.assertNotIn("file_server browse", legacy)
+        # catch-all тоже без листинга
+        self.assertIn("handle {\n\t\tfile_server\n", block)
+
+    def test_listing_handle_precedes_legacy_handle(self) -> None:
+        """Порядок решает: `@legacy` совпадает и с `/etc/install/`.
+
+        Если legacy-блок окажется первым, запрос к `/etc/install/` уйдёт в
+        него, листинга там нет, и каталог не откроется вовсе.
+        """
+        block = self._block("browse=/install/|legacy=/etc")
+        self.assertLess(block.index("handle @listing {"), block.index("handle @legacy {"))
+
+    def test_listing_matches_both_spellings_of_legacy_path(self) -> None:
+        """Клиент ходит по `/etc/install/`, а `strip_prefix` перепишет позже."""
+        block = self._block("browse=/install/|legacy=/etc")
+        matcher = block[block.index("@listing path"):block.index("\n", block.index("@listing path"))]
+        self.assertIn("/install/*", matcher)
+        self.assertIn("/etc/install/*", matcher)
+        self.assertIn("/etc/install ", matcher)
+
+    def test_legacy_prefix_without_slash_does_not_double_it(self) -> None:
+        block = self._block("browse=/install/|legacy=/etc")
+        self.assertNotIn("//", block)
+
+    def test_whole_site_browse_still_applies_inside_legacy(self) -> None:
+        """На dc зеркала именно такие: `browse` без пути."""
+        block = self._block("browse|legacy=/etc")
+        legacy = block[block.index("handle @legacy {"):block.index("handle {\n\t\tfile_server")]
+        self.assertIn("file_server browse", legacy)
 
     def test_rejects_bad_legacy(self) -> None:
         for bad in ("legacy=etc", "legacy=/etc/*", "legacy=../etc"):
